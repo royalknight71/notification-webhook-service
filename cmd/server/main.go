@@ -40,19 +40,30 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize confirmed publisher: %v", err)
 	}
-	consumerDone, err := worker.StartConsumer(ctx, connector, os.Getenv("WEBHOOK_SECRET"), store)
+	deadLetterPublisher, ok := publisher.(queue.DeadLetterPublisher)
+	if !ok {
+		log.Fatalf("publisher does not support dead-letter messages")
+	}
+	publisherHealth, ok := publisher.(queue.HealthReporter)
+	if !ok {
+		log.Fatalf("publisher does not report health")
+	}
+	consumerDone, err := worker.StartConsumer(ctx, connector, os.Getenv("WEBHOOK_SECRET"), store, deadLetterPublisher)
 	if err != nil {
 		log.Fatalf("failed to start consumer: %v", err)
 	}
 	consumerHealthy := atomic.Bool{}
 	consumerHealthy.Store(true)
-	consumerFailed := observeConsumer(ctx, consumerDone, func() { consumerHealthy.Store(false) })
+	consumerFailed := observeWorker(ctx, consumerDone, func() { consumerHealthy.Store(false) })
 	dispatcherDone := delivery.StartDispatcher(ctx, store, publisher)
+	dispatcherHealthy := atomic.Bool{}
+	dispatcherHealthy.Store(true)
+	dispatcherFailed := observeWorker(ctx, dispatcherDone, func() { dispatcherHealthy.Store(false) })
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	router.GET("/health", handler.Health)
-	router.GET("/ready", handler.Ready(dbPool, consumerHealthy.Load))
+	router.GET("/ready", handler.Ready(dbPool, consumerHealthy.Load, dispatcherHealthy.Load, publisherHealth.Healthy))
 	router.POST("/event", handler.Event(store))
 	srv := &http.Server{Addr: config.GetPort(), Handler: router}
 	serverDone := make(chan error, 1)
@@ -62,6 +73,8 @@ func main() {
 	select {
 	case <-consumerFailed:
 		log.Printf("RabbitMQ consumer stopped unexpectedly; shutting down")
+	case <-dispatcherFailed:
+		log.Printf("outbox dispatcher stopped unexpectedly; shutting down")
 	case sig := <-quit:
 		log.Printf("shutdown signal received: %v", sig)
 	case err := <-serverDone:
@@ -88,7 +101,7 @@ func main() {
 	}
 }
 
-func observeConsumer(ctx context.Context, done <-chan struct{}, onUnexpectedStop func()) <-chan struct{} {
+func observeWorker(ctx context.Context, done <-chan struct{}, onUnexpectedStop func()) <-chan struct{} {
 	failed := make(chan struct{})
 	go func() {
 		select {

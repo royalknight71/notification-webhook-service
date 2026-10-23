@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,14 +21,25 @@ import (
 )
 
 type testStore struct {
-	attempts   int
-	state      string
-	lastError  string
-	failStatus bool
+	attempts           int
+	state              string
+	lastError          string
+	failStatus         bool
+	claimErr           error
+	releaseHasDeadline bool
 }
 
 func (s *testStore) ClaimDelivery(_ context.Context, _ string, _ time.Duration) (delivery.ClaimResult, int, error) {
-	if s.state == "delivered" || s.state == "failed" {
+	if s.claimErr != nil {
+		return 0, 0, s.claimErr
+	}
+	if s.state == "failed" {
+		return delivery.ClaimFailed, s.attempts, nil
+	}
+	if s.state == "missing" {
+		return delivery.ClaimNotFound, 0, nil
+	}
+	if s.state == "delivered" {
 		return delivery.ClaimTerminal, s.attempts, nil
 	}
 	if s.state == "processing" {
@@ -57,7 +69,42 @@ func (s *testStore) MarkDelivered(context.Context, string) error {
 	s.state = "delivered"
 	return nil
 }
-func (s *testStore) ReleaseDelivery(context.Context, string) error { s.state = "pending"; return nil }
+func (s *testStore) ReleaseDelivery(ctx context.Context, _ string) error {
+	_, s.releaseHasDeadline = ctx.Deadline()
+	s.state = "pending"
+	return nil
+}
+
+type testDeadLetterPublisher struct {
+	err   error
+	id    string
+	body  []byte
+	calls int
+}
+
+func (p *testDeadLetterPublisher) PublishDeadLetter(_ context.Context, id string, body []byte) error {
+	p.calls++
+	p.id = id
+	p.body = append([]byte(nil), body...)
+	return p.err
+}
+
+type testAcknowledger struct {
+	acks  int
+	nacks int
+}
+
+func (a *testAcknowledger) Ack(uint64, bool) error {
+	a.acks++
+	return nil
+}
+
+func (a *testAcknowledger) Nack(uint64, bool, bool) error {
+	a.nacks++
+	return nil
+}
+
+func (*testAcknowledger) Reject(uint64, bool) error { return nil }
 
 // mockTransport implements http.RoundTripper and allows configuring responses.
 type mockTransport struct {
@@ -162,6 +209,147 @@ func TestProcessEvent_HMACSignature(t *testing.T) {
 	}
 }
 
+func TestRetryBackoffHasJitterAndIsBounded(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		delay := retryBackoff(1)
+		if delay < 250*time.Millisecond || delay > 375*time.Millisecond {
+			t.Fatalf("first retry delay out of bounds: %s", delay)
+		}
+		if got := retryBackoff(100); got > 5*time.Second {
+			t.Fatalf("capped retry delay exceeded maximum: %s", got)
+		}
+	}
+	for i := 0; i < 100; i++ {
+		jitter := randInt63n(100)
+		if jitter < 0 || jitter >= 100 {
+			t.Fatalf("jitter out of range: %d", jitter)
+		}
+	}
+}
+
+func TestWaitRetryStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if waitRetry(ctx, time.Second) {
+		t.Fatal("retry wait should stop on cancellation")
+	}
+}
+
+func TestProcessEvent_ClaimFailureRemainsRetryable(t *testing.T) {
+	store := &testStore{claimErr: errors.New("database unavailable")}
+	mt := &mockTransport{status: http.StatusOK}
+	ev := EventMessage{ID: "db-failure", TargetURL: "http://example.com", Payload: json.RawMessage(`{"ok":true}`)}
+	body, _ := json.Marshal(ev)
+	if err := processEvent(context.Background(), &amqp091.Delivery{Body: body}, &http.Client{Transport: mt}, "", store); err == nil {
+		t.Fatal("expected claim failure")
+	} else if errors.Is(err, errTerminal) {
+		t.Fatalf("database failure was incorrectly classified terminal: %v", err)
+	}
+	if store.state == "failed" || mt.calls != 0 {
+		t.Fatalf("database failure changed terminal state or made HTTP call: state=%s calls=%d", store.state, mt.calls)
+	}
+}
+
+func TestRouteTerminalMessagePublishesBeforeAck(t *testing.T) {
+	body := []byte("unparseable message")
+	publisher := &testDeadLetterPublisher{}
+	acked := false
+	err := routeTerminalMessage(context.Background(), publisher, "message-1", body, func() error {
+		acked = true
+		return nil
+	})
+	if err != nil || !acked || publisher.id != "message-1" || !bytes.Equal(publisher.body, body) {
+		t.Fatalf("terminal route err=%v acked=%v id=%q body=%q", err, acked, publisher.id, publisher.body)
+	}
+
+	publisher.err = errors.New("publisher unavailable")
+	acked = false
+	if err := routeTerminalMessage(context.Background(), publisher, "message-2", body, func() error {
+		acked = true
+		return nil
+	}); err == nil || acked {
+		t.Fatalf("failed dead-letter publish must not ACK: err=%v acked=%v", err, acked)
+	}
+}
+
+func TestProcessDeliveryAcksAlreadyDeliveredDuplicate(t *testing.T) {
+	d, acker := deliveryForTestMessage(t)
+	store := &testStore{state: "delivered"}
+	deadLetters := &testDeadLetterPublisher{}
+	acked, err := processDelivery(context.Background(), d, &http.Client{}, "", store, deadLetters)
+	if err != nil || !acked || acker.acks != 1 || deadLetters.calls != 0 {
+		t.Fatalf("duplicate handling: acked=%v err=%v ACKs=%d dead-letter publishes=%d", acked, err, acker.acks, deadLetters.calls)
+	}
+}
+
+func TestProcessDeliveryRoutesFailedDeliveryBeforeAck(t *testing.T) {
+	d, acker := deliveryForTestMessage(t)
+	store := &testStore{state: "failed"}
+	deadLetters := &testDeadLetterPublisher{}
+	acked, err := processDelivery(context.Background(), d, &http.Client{}, "", store, deadLetters)
+	if err != nil || !acked || acker.acks != 1 || deadLetters.calls != 1 {
+		t.Fatalf("failed delivery handling: acked=%v err=%v ACKs=%d dead-letter publishes=%d", acked, err, acker.acks, deadLetters.calls)
+	}
+}
+
+func TestProcessDeliveryRetriesFailedDeadLetterPublishOnRedelivery(t *testing.T) {
+	store := &testStore{state: "failed"}
+	deadLetters := &testDeadLetterPublisher{err: errors.New("broker unavailable")}
+	first, firstAcker := deliveryForTestMessage(t)
+	acked, err := processDelivery(context.Background(), first, &http.Client{}, "", store, deadLetters)
+	if err == nil || acked || firstAcker.acks != 0 {
+		t.Fatalf("failed DLQ publish must remain unacked: acked=%v err=%v ACKs=%d", acked, err, firstAcker.acks)
+	}
+
+	deadLetters.err = nil
+	second, secondAcker := deliveryForTestMessage(t)
+	acked, err = processDelivery(context.Background(), second, &http.Client{}, "", store, deadLetters)
+	if err != nil || !acked || secondAcker.acks != 1 || deadLetters.calls != 2 {
+		t.Fatalf("redelivery handling: acked=%v err=%v ACKs=%d dead-letter publishes=%d", acked, err, secondAcker.acks, deadLetters.calls)
+	}
+}
+
+func TestProcessDeliveryRoutesUnknownDeliveryBeforeAck(t *testing.T) {
+	d, acker := deliveryForTestMessage(t)
+	store := &testStore{state: "missing"}
+	deadLetters := &testDeadLetterPublisher{}
+	acked, err := processDelivery(context.Background(), d, &http.Client{}, "", store, deadLetters)
+	if err != nil || !acked || acker.acks != 1 || deadLetters.calls != 1 {
+		t.Fatalf("unknown delivery handling: acked=%v err=%v ACKs=%d dead-letter publishes=%d", acked, err, acker.acks, deadLetters.calls)
+	}
+}
+
+func TestProcessDeliveryRetriesUnknownDeliveryAfterDeadLetterFailure(t *testing.T) {
+	store := &testStore{state: "missing"}
+	deadLetters := &testDeadLetterPublisher{err: errors.New("broker unavailable")}
+	first, firstAcker := deliveryForTestMessage(t)
+	acked, err := processDelivery(context.Background(), first, &http.Client{}, "", store, deadLetters)
+	if err == nil || acked || firstAcker.acks != 0 {
+		t.Fatalf("failed DLQ publish must leave unknown delivery unacked: acked=%v err=%v ACKs=%d", acked, err, firstAcker.acks)
+	}
+
+	deadLetters.err = nil
+	second, secondAcker := deliveryForTestMessage(t)
+	acked, err = processDelivery(context.Background(), second, &http.Client{}, "", store, deadLetters)
+	if err != nil || !acked || secondAcker.acks != 1 || deadLetters.calls != 2 {
+		t.Fatalf("unknown delivery redelivery: acked=%v err=%v ACKs=%d dead-letter publishes=%d", acked, err, secondAcker.acks, deadLetters.calls)
+	}
+}
+
+func deliveryForTestMessage(t *testing.T) (*amqp091.Delivery, *testAcknowledger) {
+	acker := &testAcknowledger{}
+	body := rawEventMessage(t, EventMessage{ID: "failed-event", TargetURL: "https://example.test", Payload: json.RawMessage(`{"ok":true}`)})
+	return &amqp091.Delivery{Acknowledger: acker, DeliveryTag: 1, MessageId: "failed-event", Body: body}, acker
+}
+
+func TestReleaseDeliveryUsesBoundedCleanupContext(t *testing.T) {
+	store := &testStore{}
+	releaseDelivery(store, "release")
+	if !store.releaseHasDeadline {
+		t.Fatal("release cleanup context has no deadline")
+	}
+}
+
 func rawEventMessage(t *testing.T, ev EventMessage) []byte {
 	t.Helper()
 	id, err := json.Marshal(ev.ID)
@@ -243,7 +431,7 @@ func TestProcessEvent_StatusUpdateFailureRequeues(t *testing.T) {
 	}
 }
 
-func TestProcessEvent_FailedEventIsPersisted(t *testing.T) {
+func TestProcessEvent_FailedEventRemainsDeadLetterable(t *testing.T) {
 	store := &testStore{}
 	bad := &mockTransport{status: http.StatusInternalServerError}
 	client := &http.Client{Transport: bad}
@@ -255,8 +443,8 @@ func TestProcessEvent_FailedEventIsPersisted(t *testing.T) {
 		t.Fatalf("expected failed terminal state, got %s", store.state)
 	}
 	before := bad.calls
-	if err := processEvent(context.Background(), &d, client, "", store); err != nil {
-		t.Fatalf("failed duplicate should be acknowledged: %v", err)
+	if err := processEvent(context.Background(), &d, client, "", store); !errors.Is(err, errTerminal) {
+		t.Fatalf("failed duplicate should remain terminal for dead-letter routing, got %v", err)
 	}
 	if bad.calls != before {
 		t.Fatalf("failed duplicate made another HTTP call: %d to %d", before, bad.calls)

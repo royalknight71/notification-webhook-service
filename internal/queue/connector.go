@@ -10,11 +10,14 @@ import (
 )
 
 type Connector struct {
-	Conn       *amqp091.Connection
-	Channel    *amqp091.Channel
-	Exchange   string
-	Queue      string
-	RoutingKey string
+	Conn                 *amqp091.Connection
+	Channel              *amqp091.Channel
+	Exchange             string
+	Queue                string
+	RoutingKey           string
+	DeadLetterExchange   string
+	DeadLetterQueue      string
+	DeadLetterRoutingKey string
 }
 
 // InitConnector establishes a connection to RabbitMQ, declares the exchange and queue, and binds them.
@@ -94,7 +97,36 @@ func InitConnector(ctx context.Context) (*Connector, error) {
 		conn.Close()
 		return nil, fmt.Errorf("failed to bind queue: %w", err)
 	}
-	return &Connector{Conn: conn, Channel: ch, Exchange: exchange, Queue: queueName, RoutingKey: routingKey}, nil
+	deadLetterExchange := exchange + ".dead-letter"
+	deadLetterQueue := queueName + ".dead-letter"
+	deadLetterRoutingKey := routingKey + ".dead-letter"
+	if err := ch.ExchangeDeclare(
+		deadLetterExchange,
+		amqp091.ExchangeDirect,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	); err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to declare dead-letter exchange: %w", err)
+	}
+	if _, err := ch.QueueDeclare(deadLetterQueue, true, false, false, false, nil); err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to declare dead-letter queue: %w", err)
+	}
+	if err := ch.QueueBind(deadLetterQueue, deadLetterRoutingKey, deadLetterExchange, false, nil); err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to bind dead-letter queue: %w", err)
+	}
+	return &Connector{
+		Conn: conn, Channel: ch, Exchange: exchange, Queue: queueName, RoutingKey: routingKey,
+		DeadLetterExchange: deadLetterExchange, DeadLetterQueue: deadLetterQueue, DeadLetterRoutingKey: deadLetterRoutingKey,
+	}, nil
 }
 
 // Close safely shuts down the channel and connection. It is safe to call multiple times.

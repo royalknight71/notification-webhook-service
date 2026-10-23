@@ -11,7 +11,7 @@ func TestObserveConsumerReportsUnexpectedStop(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	failed := make(chan struct{})
-	observed := observeConsumer(ctx, done, func() { close(failed) })
+	observed := observeWorker(ctx, done, func() { close(failed) })
 	close(done)
 	select {
 	case <-observed:
@@ -29,7 +29,7 @@ func TestObserveConsumerIgnoresShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	failed := make(chan struct{})
-	observed := observeConsumer(ctx, done, func() { close(failed) })
+	observed := observeWorker(ctx, done, func() { close(failed) })
 	cancel()
 	close(done)
 	select {
