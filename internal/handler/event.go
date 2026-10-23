@@ -1,48 +1,56 @@
 package handler
 
 import (
-    "net/http"
-    "github.com/gin-gonic/gin"
-    "github.com/google/uuid"
-    "notification-webhook-service/internal/queue"
-    "encoding/json"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"notification-webhook-service/internal/delivery"
 )
 
 type EventRequest struct {
-    TargetURL string          `json:"target_url,omitempty"`
-    Payload   json.RawMessage `json:"payload"`
+	TargetURL string          `json:"target_url,omitempty"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
-// Event returns a Gin handler that accepts a webhook event, assigns a UUID, and publishes it.
-// If the publisher is nil (RabbitMQ unavailable), it returns 503 Service Unavailable.
-func Event(publisher queue.Publisher) gin.HandlerFunc {
-    return func(c *gin.Context) {
-        var req EventRequest
-        if err := c.ShouldBindJSON(&req); err != nil {
-            c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON payload"})
-            return
-        }
-        // Generate event ID.
-        id := uuid.New().String()
-        // Build envelope that includes ID, target URL and payload.
-        envelope := map[string]any{
-            "id":        id,
-            "target_url": req.TargetURL,
-            "payload":   req.Payload,
-        }
-        data, err := json.Marshal(envelope)
-        if err != nil {
-            c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to serialize event"})
-            return
-        }
-        if publisher == nil {
-            c.JSON(http.StatusServiceUnavailable, gin.H{"error": "event publishing unavailable"})
-            return
-        }
-        if err := publisher.Publish(data); err != nil {
-            c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to publish event"})
-            return
-        }
-        c.JSON(http.StatusAccepted, gin.H{"event_id": id})
-    }
+type EventStore interface {
+	Accept(context.Context, delivery.Event) (bool, error)
+}
+
+// Event accepts an event after it and its outbox record have been committed.
+func Event(store EventStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req EventRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON payload"})
+			return
+		}
+		// Generate event ID.
+		id := uuid.New().String()
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "event storage unavailable"})
+			return
+		}
+		payload := req.Payload
+		if len(payload) == 0 {
+			payload = json.RawMessage("null")
+		}
+		inserted, err := store.Accept(c.Request.Context(), delivery.Event{ID: id, TargetURL: req.TargetURL, Payload: json.RawMessage(payload)})
+		if err != nil {
+			if errors.Is(err, delivery.ErrIDConflict) {
+				c.JSON(http.StatusConflict, gin.H{"error": "event ID conflict"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist event"})
+			return
+		}
+		if !inserted {
+			c.JSON(http.StatusConflict, gin.H{"error": "event already exists"})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"event_id": id})
+	}
 }
