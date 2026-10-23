@@ -105,8 +105,12 @@ func TestStorePostgresIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, _, err = store.ClaimDelivery(ctx, event.ID, time.Minute)
-	if err != nil || claim != ClaimTerminal {
-		t.Fatalf("failed delivery should be terminal; got %v err=%v", claim, err)
+	if err != nil || claim != ClaimFailed {
+		t.Fatalf("failed delivery should be claimable for dead-letter routing; got %v err=%v", claim, err)
+	}
+	claim, _, err = store.ClaimDelivery(ctx, uuid.NewString(), time.Minute)
+	if err != nil || claim != ClaimNotFound {
+		t.Fatalf("unknown delivery should be distinguished; got %v err=%v", claim, err)
 	}
 	state, err := store.GetDeliveryState(ctx, event.ID)
 	if err != nil || state != "failed" {

@@ -16,6 +16,10 @@ type fakePublisher struct {
 	body  []byte
 }
 
+type unhealthyPublisher struct{ fakePublisher }
+
+func (unhealthyPublisher) Healthy() bool { return false }
+
 func (p *fakePublisher) Publish(_ context.Context, id string, body []byte) error {
 	p.calls++
 	p.id = id
@@ -83,5 +87,16 @@ func TestMarshalEventPreservesRawPayloadBytes(t *testing.T) {
 	}
 	if !bytes.Equal(envelope.Payload, payload) {
 		t.Fatalf("payload bytes changed in outbox envelope: got %q, want %q", envelope.Payload, payload)
+	}
+}
+
+func TestDispatcherStopsWhenPublisherIsUnhealthy(t *testing.T) {
+	store := &fakeOutbox{items: []OutboxItem{{Event: Event{ID: "event-1", TargetURL: "https://example.test", Payload: []byte(`null`)}, ClaimToken: "claim"}}}
+	publisher := &unhealthyPublisher{fakePublisher: fakePublisher{err: errors.New("publisher failed")}}
+	done := StartDispatcher(context.Background(), store, publisher)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher did not stop after publisher became unhealthy")
 	}
 }

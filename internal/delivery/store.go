@@ -32,6 +32,8 @@ const (
 	Claimed ClaimResult = iota
 	ClaimBusy
 	ClaimTerminal
+	ClaimFailed
+	ClaimNotFound
 )
 
 type Store struct{ pool *pgxpool.Pool }
@@ -188,12 +190,15 @@ func (s *Store) ClaimDelivery(ctx context.Context, id string, lease time.Duratio
 	var state string
 	err = s.pool.QueryRow(ctx, `SELECT state FROM deliveries WHERE event_id=$1`, id).Scan(&state)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ClaimTerminal, 0, nil
+		return ClaimNotFound, 0, nil
 	}
 	if err != nil {
 		return 0, 0, err
 	}
-	if state == "delivered" || state == "failed" {
+	if state == "failed" {
+		return ClaimFailed, 0, nil
+	}
+	if state == "delivered" {
 		return ClaimTerminal, 0, nil
 	}
 	return ClaimBusy, 0, nil

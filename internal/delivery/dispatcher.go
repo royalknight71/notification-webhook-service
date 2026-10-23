@@ -28,6 +28,10 @@ func StartDispatcher(ctx context.Context, store OutboxStore, publisher queue.Pub
 		defer ticker.Stop()
 		for {
 			dispatchBatch(ctx, store, publisher)
+			if health, ok := publisher.(queue.HealthReporter); ok && !health.Healthy() {
+				log.Printf("outbox dispatcher stopped because publisher is unhealthy")
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
