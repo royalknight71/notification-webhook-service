@@ -32,6 +32,31 @@ Run the service with `go run ./cmd/server`. The server applies embedded, version
 
 The service assigns a UUID and commits the event, pending delivery, and outbox record in one PostgreSQL transaction. `202 Accepted` with `{ "event_id": "..." }` means that transaction committed; RabbitMQ and webhook delivery are asynchronous. Invalid JSON returns `400`; persistence failures return `500`.
 
+### Testing a webhook on the Windows host
+
+When `go run ./cmd/server` runs directly on Windows, its consumer is a host process. For a local test receiver, use `127.0.0.1` as the webhook URL; `host.docker.internal` is intended for containers reaching the host and may not resolve in a host process. PowerShell `HttpListener` can also reject host headers that do not match its registered prefixes.
+
+Start the repository's loopback-only receiver in a separate terminal:
+
+```powershell
+go run ./cmd/test-webhook
+```
+
+It listens at `http://127.0.0.1:8091/`, accepts POSTs from the local service, and prints the received body bytes and `X-Signature`. Submit an event with that URL as `target_url`. The receiver is a local development aid; it does not change production delivery behavior.
+
+For example, from another PowerShell terminal:
+
+```powershell
+$body = '{"target_url":"http://127.0.0.1:8091/","payload":{"message":"local test"}}'
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8081/event' -ContentType 'application/json' -Body $body
+```
+
+The response includes the event ID. Check its persisted result with:
+
+```powershell
+docker exec notification-webhook-service-postgres-1 psql -U user -d notification_service -c "SELECT state, delivered_at FROM deliveries WHERE event_id = '<event-id>';"
+```
+
 ## Persistence and delivery
 
 The embedded migration creates `webhook_events`, `deliveries`, and `delivery_outbox`. Stable event IDs are unique. Delivery states are `pending`, `processing`, `delivered`, and `failed`, with persisted attempt count, timestamps, and last error.
@@ -57,10 +82,13 @@ go fmt ./...
 docker compose config
 ```
 
-The PostgreSQL integration test is opt-in and uses a separate schema in the database given by `TEST_DATABASE_URL`. Point it only at a disposable test database:
+Integration tests are opt-in. PostgreSQL tests create a unique schema in `TEST_DATABASE_URL`. RabbitMQ tests use uniquely named durable exchanges and queues in `TEST_RABBITMQ_URL`; use a disposable vhost. The end-to-end test requires both variables. Tests skip with a clear message when their required variables are absent. These URLs are separate from the service's `DATABASE_URL` and `RABBITMQ_URL` settings.
 
 ```sh
-go test ./internal/delivery -run TestStorePostgresIntegration -v
+docker compose up -d postgres rabbitmq
+go test ./internal/delivery -run TestStorePostgres -v
+go test ./internal/queue -run TestRabbitMQ -v
+go test ./internal/integration -run TestEndToEnd -v
 ```
 
-Unit tests use fakes and do not require Docker. `docker-compose.yml` starts only the PostgreSQL and RabbitMQ dependencies; run the Go server separately.
+For PowerShell, set `TEST_DATABASE_URL` to a disposable local database (for the Compose defaults: `postgres://user:password@localhost:5432/notification_service?sslmode=disable`) and `TEST_RABBITMQ_URL` to a disposable vhost (for example `amqp://guest:guest@localhost:5672/`) before running the commands. The tests clean up their schemas and uniquely named RabbitMQ resources. Unit tests use fakes and do not require Docker. `docker-compose.yml` starts only PostgreSQL and RabbitMQ; run the Go server separately.
