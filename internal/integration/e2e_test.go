@@ -57,15 +57,17 @@ func TestEndToEndEventDeliveryRetryAndDeadLetter(t *testing.T) {
 		t.Fatal(err)
 	}
 	serviceCtx, stopService := context.WithCancel(ctx)
-	consumerDone, err := worker.StartConsumer(serviceCtx, connector, "integration-secret", store, publisher.(queue.DeadLetterPublisher))
+	consumer, err := worker.StartConsumer(serviceCtx, connector, "integration-secret", store, publisher.(queue.DeadLetterPublisher))
 	if err != nil {
 		stopService()
 		_ = connector.Close()
 		cleanupDB()
 		t.Fatal(err)
 	}
+	consumerDone := consumer.Done
 	dispatcherDone := delivery.StartDispatcher(serviceCtx, store, publisher)
 	t.Cleanup(func() {
+		consumer.StopAccepting()
 		stopService()
 		select {
 		case <-consumerDone:

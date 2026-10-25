@@ -480,3 +480,15 @@ func TestWaitBusyRetryDelaysAndCancels(t *testing.T) {
 		t.Fatal("busy retry should stop promptly on cancellation")
 	}
 }
+
+func TestConsumerStopAcceptingIsIdempotent(t *testing.T) {
+	stopping := make(chan struct{})
+	handle := &ConsumerHandle{Stopping: stopping, stop: stopping}
+	handle.StopAccepting()
+	handle.StopAccepting()
+	select {
+	case <-handle.Stopping:
+	default:
+		t.Fatal("consumer stop signal was not closed")
+	}
+}

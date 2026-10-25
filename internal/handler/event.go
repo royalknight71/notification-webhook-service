@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"notification-webhook-service/internal/delivery"
+	"notification-webhook-service/internal/observability"
 )
 
 type EventRequest struct {
@@ -40,6 +42,7 @@ func Event(store EventStore) gin.HandlerFunc {
 		}
 		inserted, err := store.Accept(c.Request.Context(), delivery.Event{ID: id, TargetURL: req.TargetURL, Payload: json.RawMessage(payload)})
 		if err != nil {
+			slog.ErrorContext(c.Request.Context(), "event persistence failed", "event_id", id, "error", observability.ErrorSummary(err))
 			if errors.Is(err, delivery.ErrIDConflict) {
 				c.JSON(http.StatusConflict, gin.H{"error": "event ID conflict"})
 				return
@@ -48,9 +51,11 @@ func Event(store EventStore) gin.HandlerFunc {
 			return
 		}
 		if !inserted {
+			slog.InfoContext(c.Request.Context(), "duplicate event accepted as existing", "event_id", id)
 			c.JSON(http.StatusConflict, gin.H{"error": "event already exists"})
 			return
 		}
+		slog.InfoContext(c.Request.Context(), "event accepted", "event_id", id)
 		c.JSON(http.StatusAccepted, gin.H{"event_id": id})
 	}
 }
