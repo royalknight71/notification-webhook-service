@@ -34,6 +34,8 @@ Run the service with `go run ./cmd/server`. The server applies embedded, version
 
 The service assigns a UUID and commits the event, pending delivery, and outbox record in one PostgreSQL transaction. `202 Accepted` with `{ "event_id": "..." }` means that transaction committed; RabbitMQ and webhook delivery are asynchronous. Invalid JSON returns `400`; persistence failures return `500`.
 
+Clients may send an `Idempotency-Key` header (1–255 bytes) to make an API retry safe. The first request and an identical replay both return `202 Accepted` with the same `{ "event_id": "..." }` body; the replay response has `Idempotency-Replayed: true` and the first response has `Idempotency-Replayed: false`. Reusing a key with a different `target_url` or different raw `payload` bytes returns `409 Conflict`. Payload comparison is byte-for-byte, so whitespace, object key order, and numeric formatting differences count as different requests. Requests without the header keep the existing behavior and each receive a new event ID. Keys are unique across this service because the API does not currently identify individual clients. Idempotency prevents duplicate event/outbox acceptance; webhook delivery remains at least once, not exactly once.
+
 ### Testing a webhook on the Windows host
 
 When `go run ./cmd/server` runs directly on Windows, its consumer is a host process. For a local test receiver, use `127.0.0.1` as the webhook URL; `host.docker.internal` is intended for containers reaching the host and may not resolve in a host process. PowerShell `HttpListener` can also reject host headers that do not match its registered prefixes.
@@ -134,7 +136,20 @@ go test ./internal/queue -run TestRabbitMQ -v
 go test ./internal/integration -run TestEndToEnd -v
 ```
 
-For PowerShell, set `TEST_DATABASE_URL` to a disposable local database (for the Compose defaults: `postgres://user:password@localhost:5433/notification_service?sslmode=disable`) and `TEST_RABBITMQ_URL` to a disposable vhost (for example `amqp://guest:guest@localhost:5672/`) before running the commands. The tests clean up their schemas and uniquely named RabbitMQ resources. Unit tests use fakes and do not require Docker. `docker-compose.yml` starts only PostgreSQL and RabbitMQ; run the Go server separately.
+For PowerShell, configure both URLs in the current session with credentials for dedicated test resources. Replace every placeholder below with the values for your test-only PostgreSQL database and RabbitMQ vhost; these examples are not usable as written:
+
+```powershell
+$env:TEST_DATABASE_URL = 'postgres://<test-role>:<test-password>@127.0.0.1:<postgres-port>/<disposable-test-database>?sslmode=disable'
+$env:TEST_RABBITMQ_URL = 'amqp://<test-user>:<test-password>@127.0.0.1:<rabbitmq-port>/<isolated-test-vhost>'
+```
+
+**Never point `TEST_DATABASE_URL` at the development database (including the Compose `notification_service` database), or `TEST_RABBITMQ_URL` at the default/application vhost.** The PostgreSQL helper creates and drops a unique schema in the selected database; it does not create a separate database for you. RabbitMQ tests use unique resource names and clean up the queues and exchanges they create, but still require an isolated test vhost. The end-to-end test requires both URLs. Tests skip with a clear message when required variables are absent. Remove the variables from the current PowerShell session when finished:
+
+```powershell
+Remove-Item Env:TEST_DATABASE_URL, Env:TEST_RABBITMQ_URL -ErrorAction SilentlyContinue
+```
+
+Unit tests use fakes and do not require Docker. `docker-compose.yml` starts the local application dependencies; its PostgreSQL database and default RabbitMQ vhost are not integration-test resources.
 
 ### Shutdown and timeouts
 

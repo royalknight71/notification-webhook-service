@@ -107,41 +107,73 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 // Accept atomically stores the event, delivery state, and outbox record.
 func (s *Store) Accept(ctx context.Context, ev Event) (bool, error) {
+	_, inserted, err := s.accept(ctx, ev, "")
+	return inserted, err
+}
+
+// AcceptWithIdempotencyKey atomically stores an event and its idempotency key.
+// A replay returns the original event ID with inserted=false.
+func (s *Store) AcceptWithIdempotencyKey(ctx context.Context, ev Event, key string) (string, bool, error) {
+	if key == "" {
+		return "", false, errors.New("idempotency key must not be empty")
+	}
+	return s.accept(ctx, ev, key)
+}
+
+func (s *Store) accept(ctx context.Context, ev Event, idempotencyKey string) (string, bool, error) {
 	ctx, cancel := databaseContext(ctx)
 	defer cancel()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("begin event transaction: %w", err)
+		return "", false, fmt.Errorf("begin event transaction: %w", err)
 	}
 	defer rollback(tx)
 	var inserted string
-	err = tx.QueryRow(ctx, `INSERT INTO webhook_events(id,target_url,payload) VALUES($1,$2,$3) ON CONFLICT(id) DO NOTHING RETURNING id`, ev.ID, ev.TargetURL, ev.Payload).Scan(&inserted)
+	if idempotencyKey != "" {
+		err = tx.QueryRow(ctx, `INSERT INTO webhook_events(id,idempotency_key,target_url,payload) VALUES($1,$2,$3,$4) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, ev.ID, idempotencyKey, ev.TargetURL, ev.Payload).Scan(&inserted)
+		if errors.Is(err, pgx.ErrNoRows) {
+			var existingID string
+			var same bool
+			lookupErr := tx.QueryRow(ctx, `SELECT id,target_url=$2 AND payload=$3 FROM webhook_events WHERE idempotency_key=$1`, idempotencyKey, ev.TargetURL, ev.Payload).Scan(&existingID, &same)
+			if lookupErr != nil {
+				return "", false, fmt.Errorf("lookup idempotency key after insert conflict: %w", lookupErr)
+			}
+			if !same {
+				return "", false, ErrIdempotencyConflict
+			}
+			rollback(tx)
+			return existingID, false, nil
+		}
+	} else {
+		err = tx.QueryRow(ctx, `INSERT INTO webhook_events(id,target_url,payload) VALUES($1,$2,$3) ON CONFLICT(id) DO NOTHING RETURNING id`, ev.ID, ev.TargetURL, ev.Payload).Scan(&inserted)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		var same bool
 		if err = tx.QueryRow(ctx, `SELECT target_url=$2 AND payload=$3 FROM webhook_events WHERE id=$1`, ev.ID, ev.TargetURL, ev.Payload).Scan(&same); err != nil {
-			return false, fmt.Errorf("check duplicate event: %w", err)
+			return "", false, fmt.Errorf("check duplicate event: %w", err)
 		}
 		if !same {
-			return false, ErrIDConflict
+			return "", false, ErrIDConflict
 		}
-		return false, nil
+		return ev.ID, false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("insert event: %w", err)
+		return "", false, fmt.Errorf("insert event: %w", err)
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO deliveries(event_id) VALUES($1)`, ev.ID); err != nil {
-		return false, fmt.Errorf("insert delivery: %w", err)
+		return "", false, fmt.Errorf("insert delivery: %w", err)
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO delivery_outbox(event_id) VALUES($1)`, ev.ID); err != nil {
-		return false, fmt.Errorf("insert outbox: %w", err)
+		return "", false, fmt.Errorf("insert outbox: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit event: %w", err)
+		return "", false, fmt.Errorf("commit event: %w", err)
 	}
-	return true, nil
+	return ev.ID, true, nil
 }
 
 var ErrIDConflict = errors.New("event ID already exists with different content")
+var ErrIdempotencyConflict = errors.New("idempotency key already exists with different request")
 
 func (s *Store) ClaimOutbox(ctx context.Context, limit int, lease time.Duration) ([]OutboxItem, error) {
 	if limit < 1 {
