@@ -2,6 +2,7 @@ package delivery
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -163,11 +164,12 @@ func TestStorePostgresAcceptRollsBackAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	key := "rollback-" + uuid.NewString()
 	event := Event{ID: uuid.NewString(), TargetURL: "https://example.test", Payload: []byte(`{"ok":true}`)}
-	if inserted, err := store.Accept(ctx, event); err == nil || inserted {
+	if _, inserted, err := store.AcceptWithIdempotencyKey(ctx, event, key); err == nil || inserted {
 		t.Fatalf("expected injected outbox failure and transaction rollback; inserted=%v err=%v", inserted, err)
 	}
-	var events, deliveries, outbox int
+	var events, deliveries, outbox, keys int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM webhook_events WHERE id=$1`, event.ID).Scan(&events); err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +179,136 @@ func TestStorePostgresAcceptRollsBackAtomically(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM delivery_outbox WHERE event_id=$1`, event.ID).Scan(&outbox); err != nil {
 		t.Fatal(err)
 	}
-	if events != 0 || deliveries != 0 || outbox != 0 {
-		t.Fatalf("partial event transaction remains: events=%d deliveries=%d outbox=%d", events, deliveries, outbox)
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM webhook_events WHERE idempotency_key=$1`, key).Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 || deliveries != 0 || outbox != 0 || keys != 0 {
+		t.Fatalf("partial event transaction remains: events=%d deliveries=%d outbox=%d idempotency_records=%d", events, deliveries, outbox, keys)
+	}
+}
+
+func TestStorePostgresIdempotencyReplayAndExactRequestComparison(t *testing.T) {
+	ctx, pool, store := postgresIntegrationStore(t)
+	key := "same-key-" + uuid.NewString()
+	payload := []byte("{\n  \"z\": 1.00, \"a\": 2e+03\n}")
+	event := Event{ID: uuid.NewString(), TargetURL: "https://example.test/hook", Payload: payload}
+	id, inserted, err := store.AcceptWithIdempotencyKey(ctx, event, key)
+	if err != nil || !inserted || id != event.ID {
+		t.Fatalf("first accept id=%q inserted=%v err=%v", id, inserted, err)
+	}
+	replayEvent := event
+	replayEvent.ID = uuid.NewString()
+	id, inserted, err = store.AcceptWithIdempotencyKey(ctx, replayEvent, key)
+	if err != nil || inserted || id != event.ID {
+		t.Fatalf("replay id=%q inserted=%v err=%v, want original %q", id, inserted, err, event.ID)
+	}
+	changedPayload := replayEvent
+	changedPayload.Payload = []byte("{\"z\":1.0,\"a\":2e+03}")
+	if _, _, err := store.AcceptWithIdempotencyKey(ctx, changedPayload, key); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("raw payload difference conflict err=%v", err)
+	}
+	changedTarget := replayEvent
+	changedTarget.TargetURL += "/different"
+	if _, _, err := store.AcceptWithIdempotencyKey(ctx, changedTarget, key); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("target difference conflict err=%v", err)
+	}
+	var events, deliveries, outbox int
+	for query, dest := range map[string]*int{
+		`SELECT count(*) FROM webhook_events WHERE idempotency_key=$1`: &events,
+		`SELECT count(*) FROM deliveries WHERE event_id=$1`:            &deliveries,
+		`SELECT count(*) FROM delivery_outbox WHERE event_id=$1`:       &outbox,
+	} {
+		arg := any(event.ID)
+		if strings.Contains(query, "idempotency_key") {
+			arg = key
+		}
+		if err := pool.QueryRow(ctx, query, arg).Scan(dest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if events != 1 || deliveries != 1 || outbox != 1 {
+		t.Fatalf("replay/mismatch created duplicates: events=%d deliveries=%d outbox=%d", events, deliveries, outbox)
+	}
+}
+
+func TestStorePostgresConcurrentIdempotencyKeys(t *testing.T) {
+	ctx, pool, store := postgresIntegrationStore(t)
+	const workers = 12
+	key := "concurrent-" + uuid.NewString()
+	start := make(chan struct{})
+	type result struct {
+		id       string
+		inserted bool
+		err      error
+	}
+	results := make(chan result, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			event := Event{ID: uuid.NewString(), TargetURL: "https://example.test/hook", Payload: []byte("{ \"same\": true }")}
+			id, inserted, err := store.AcceptWithIdempotencyKey(ctx, event, key)
+			results <- result{id: id, inserted: inserted, err: err}
+		}()
+	}
+	close(start)
+	winnerID := ""
+	insertedCount := 0
+	for i := 0; i < workers; i++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("concurrent accept: %v", got.err)
+		}
+		if got.inserted {
+			insertedCount++
+		}
+		if winnerID == "" {
+			winnerID = got.id
+		} else if got.id != winnerID {
+			t.Fatalf("returned event IDs differ: %q and %q", got.id, winnerID)
+		}
+	}
+	if insertedCount != 1 {
+		t.Fatalf("inserted count=%d, want 1", insertedCount)
+	}
+	var events, deliveries, outbox int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM webhook_events WHERE idempotency_key=$1`, key).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM deliveries WHERE event_id=$1`, winnerID).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM delivery_outbox WHERE event_id=$1`, winnerID).Scan(&outbox); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 || deliveries != 1 || outbox != 1 {
+		t.Fatalf("concurrent duplicates persisted: events=%d deliveries=%d outbox=%d", events, deliveries, outbox)
+	}
+}
+
+func TestStorePostgresIdempotencyConflictLookupFailures(t *testing.T) {
+	ctx, pool, store := postgresIntegrationStore(t)
+	keys := []string{"hidden-" + uuid.NewString(), "error-" + uuid.NewString()}
+	for _, key := range keys {
+		event := Event{ID: uuid.NewString(), TargetURL: "https://example.test", Payload: []byte(`{"lookup":true}`)}
+		if _, inserted, err := store.AcceptWithIdempotencyKey(ctx, event, key); err != nil || !inserted {
+			t.Fatalf("seed key %q inserted=%v err=%v", key, inserted, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE webhook_events ENABLE ROW LEVEL SECURITY; ALTER TABLE webhook_events FORCE ROW LEVEL SECURITY; CREATE POLICY webhook_events_insert_test ON webhook_events FOR INSERT WITH CHECK (true); CREATE POLICY webhook_events_select_test ON webhook_events FOR SELECT USING (false)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys[:1] {
+		_, inserted, err := store.AcceptWithIdempotencyKey(ctx, Event{ID: uuid.NewString(), TargetURL: "https://example.test", Payload: []byte(`{"lookup":true}`)}, key)
+		if err == nil || inserted || errors.Is(err, ErrIdempotencyConflict) {
+			t.Fatalf("hidden conflict lookup inserted=%v err=%v; want database/not-found error, not success or conflict", inserted, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `DROP POLICY webhook_events_select_test ON webhook_events; CREATE FUNCTION fail_idempotency_select() RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected lookup failure'; END $$; CREATE POLICY webhook_events_select_test ON webhook_events FOR SELECT USING (fail_idempotency_select())`); err != nil {
+		t.Fatal(err)
+	}
+	_, inserted, err := store.AcceptWithIdempotencyKey(ctx, Event{ID: uuid.NewString(), TargetURL: "https://example.test", Payload: []byte(`{"lookup":true}`)}, keys[1])
+	if err == nil || inserted || errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("failed conflict lookup inserted=%v err=%v; want database error, not success or conflict", inserted, err)
 	}
 }
 

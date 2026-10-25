@@ -133,7 +133,25 @@ func TestEndToEndEventDeliveryRetryAndDeadLetter(t *testing.T) {
 	defer api.Close()
 
 	rawPayload := []byte("{\n  \"z\": 1.00, \"a\": 2e+03\n}")
-	goodID := postEvent(t, api.URL, webhook.URL+"/success", rawPayload)
+	idempotencyKey := "e2e-" + suffix
+	goodID, replayed := postEventWithKey(t, api.URL, webhook.URL+"/success", rawPayload, idempotencyKey)
+	if replayed {
+		t.Fatal("first idempotent request was reported as a replay")
+	}
+	replayID, replayed := postEventWithKey(t, api.URL, webhook.URL+"/success", rawPayload, idempotencyKey)
+	if !replayed || replayID != goodID {
+		t.Fatalf("idempotent replay id=%q replayed=%v, want id=%q replayed=true", replayID, replayed, goodID)
+	}
+	var keyedEvents, keyedOutbox int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM webhook_events WHERE idempotency_key=$1`, idempotencyKey).Scan(&keyedEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM delivery_outbox WHERE event_id=$1`, goodID).Scan(&keyedOutbox); err != nil {
+		t.Fatal(err)
+	}
+	if keyedEvents != 1 || keyedOutbox != 1 {
+		t.Fatalf("idempotency persisted events=%d outbox=%d, want one each", keyedEvents, keyedOutbox)
+	}
 	waitState(t, ctx, store, goodID, "delivered")
 	select {
 	case got := <-goodCalls:
@@ -253,6 +271,15 @@ func newTestStore(t *testing.T, ctx context.Context, url string) (*pgxpool.Pool,
 
 func postEvent(t *testing.T, apiURL, target string, payload []byte) string {
 	t.Helper()
+	id, replayed := postEventWithKey(t, apiURL, target, payload, "")
+	if replayed {
+		t.Fatal("request without a key was marked replayed")
+	}
+	return id
+}
+
+func postEventWithKey(t *testing.T, apiURL, target string, payload []byte, key string) (string, bool) {
+	t.Helper()
 	targetJSON, _ := json.Marshal(target)
 	requestBody := append([]byte(`{"target_url":`), targetJSON...)
 	requestBody = append(requestBody, []byte(`,"payload":`)...)
@@ -263,6 +290,9 @@ func postEvent(t *testing.T, apiURL, target string, payload []byte) string {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -278,7 +308,7 @@ func postEvent(t *testing.T, apiURL, target string, payload []byte) string {
 	if err := json.Unmarshal(body, &result); err != nil || result.ID == "" {
 		t.Fatalf("invalid event response %s: %v", body, err)
 	}
-	return result.ID
+	return result.ID, resp.Header.Get("Idempotency-Replayed") == "true"
 }
 
 func waitState(t *testing.T, ctx context.Context, store *delivery.Store, id, want string) {

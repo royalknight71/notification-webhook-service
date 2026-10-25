@@ -20,7 +20,10 @@ type EventRequest struct {
 
 type EventStore interface {
 	Accept(context.Context, delivery.Event) (bool, error)
+	AcceptWithIdempotencyKey(context.Context, delivery.Event, string) (string, bool, error)
 }
+
+const maxIdempotencyKeyBytes = 255
 
 // Event accepts an event after it and its outbox record have been committed.
 func Event(store EventStore, metrics ...*observability.Metrics) gin.HandlerFunc {
@@ -46,10 +49,31 @@ func Event(store EventStore, metrics ...*observability.Metrics) gin.HandlerFunc 
 		if len(payload) == 0 {
 			payload = json.RawMessage("null")
 		}
-		inserted, err := store.Accept(c.Request.Context(), delivery.Event{ID: id, TargetURL: req.TargetURL, Payload: json.RawMessage(payload)})
+		event := delivery.Event{ID: id, TargetURL: req.TargetURL, Payload: json.RawMessage(payload)}
+		keys := c.Request.Header.Values("Idempotency-Key")
+		idempotencyKey := ""
+		if len(keys) > 1 || (len(keys) == 1 && (keys[0] == "" || len(keys[0]) > maxIdempotencyKeyBytes)) {
+			metric.IncEventRejected()
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid Idempotency-Key header"})
+			return
+		}
+		if len(keys) == 1 {
+			idempotencyKey = keys[0]
+		}
+		var inserted bool
+		var err error
+		if idempotencyKey == "" {
+			inserted, err = store.Accept(c.Request.Context(), event)
+		} else {
+			id, inserted, err = store.AcceptWithIdempotencyKey(c.Request.Context(), event, idempotencyKey)
+		}
 		if err != nil {
 			metric.IncEventRejected()
 			slog.ErrorContext(c.Request.Context(), "event persistence failed", "event_id", id, "error", observability.ErrorSummary(err))
+			if errors.Is(err, delivery.ErrIdempotencyConflict) {
+				c.JSON(http.StatusConflict, gin.H{"error": "idempotency key reused with different request"})
+				return
+			}
 			if errors.Is(err, delivery.ErrIDConflict) {
 				c.JSON(http.StatusConflict, gin.H{"error": "event ID conflict"})
 				return
@@ -58,6 +82,12 @@ func Event(store EventStore, metrics ...*observability.Metrics) gin.HandlerFunc 
 			return
 		}
 		if !inserted {
+			if idempotencyKey != "" {
+				c.Header("Idempotency-Replayed", "true")
+				slog.InfoContext(c.Request.Context(), "event idempotency replayed", "event_id", id)
+				c.JSON(http.StatusAccepted, gin.H{"event_id": id})
+				return
+			}
 			metric.IncEventRejected()
 			slog.InfoContext(c.Request.Context(), "duplicate event accepted as existing", "event_id", id)
 			c.JSON(http.StatusConflict, gin.H{"error": "event already exists"})
@@ -65,6 +95,9 @@ func Event(store EventStore, metrics ...*observability.Metrics) gin.HandlerFunc 
 		}
 		metric.IncEventAccepted()
 		slog.InfoContext(c.Request.Context(), "event accepted", "event_id", id)
+		if idempotencyKey != "" {
+			c.Header("Idempotency-Replayed", "false")
+		}
 		c.JSON(http.StatusAccepted, gin.H{"event_id": id})
 	}
 }
