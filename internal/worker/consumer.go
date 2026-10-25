@@ -52,7 +52,11 @@ func (c *ConsumerHandle) StopAccepting() {
 // StartConsumer starts a single-message-at-a-time worker. StopAccepting stops
 // intake after the current delivery finishes; the service context remains the
 // hard-stop path.
-func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret string, store DeliveryStore, deadLetters queue.DeadLetterPublisher) (*ConsumerHandle, error) {
+func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret string, store DeliveryStore, deadLetters queue.DeadLetterPublisher, metrics ...*observability.Metrics) (*ConsumerHandle, error) {
+	var metric *observability.Metrics
+	if len(metrics) > 0 {
+		metric = metrics[0]
+	}
 	// Processing is serial; a prefetch of one keeps shutdown from accumulating
 	// unbounded unacknowledged deliveries in the client.
 	if err := conn.Channel.Qos(1, 0, false); err != nil {
@@ -68,6 +72,8 @@ func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret str
 	client := &http.Client{Timeout: 5 * time.Second}
 	go func() {
 		defer close(done)
+		metric.SetConsumerRunning(true)
+		defer metric.SetConsumerRunning(false)
 		retryAttempt := 0
 		for {
 			if ctx.Err() != nil {
@@ -92,7 +98,7 @@ func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret str
 					return
 				default:
 				}
-				acked, err := processDelivery(ctx, &d, client, webhookSecret, store, deadLetters)
+				acked, err := processDelivery(ctx, &d, client, webhookSecret, store, deadLetters, metric)
 				if err != nil {
 					slog.ErrorContext(ctx, "delivery processing failed", "event_id", d.MessageId, "error", observability.ErrorSummary(err))
 					if ctx.Err() != nil {
@@ -114,8 +120,8 @@ func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret str
 	return handle, nil
 }
 
-func processDelivery(ctx context.Context, d *amqp091.Delivery, client *http.Client, webhookSecret string, store DeliveryStore, deadLetters queue.DeadLetterPublisher) (bool, error) {
-	err := processEvent(ctx, d, client, webhookSecret, store)
+func processDelivery(ctx context.Context, d *amqp091.Delivery, client *http.Client, webhookSecret string, store DeliveryStore, deadLetters queue.DeadLetterPublisher, metrics ...*observability.Metrics) (bool, error) {
+	err := processEvent(ctx, d, client, webhookSecret, store, metrics...)
 	if err == nil {
 		if ackErr := d.Ack(false); ackErr != nil {
 			slog.ErrorContext(ctx, "delivery ack failed", "event_id", d.MessageId, "error", observability.ErrorSummary(ackErr))
@@ -194,7 +200,11 @@ func releaseDelivery(store DeliveryStore, eventID string) {
 	}
 }
 
-func processEvent(ctx context.Context, d *amqp091.Delivery, client *http.Client, webhookSecret string, store DeliveryStore) error {
+func processEvent(ctx context.Context, d *amqp091.Delivery, client *http.Client, webhookSecret string, store DeliveryStore, metrics ...*observability.Metrics) error {
+	var metric *observability.Metrics
+	if len(metrics) > 0 {
+		metric = metrics[0]
+	}
 	var ev EventMessage
 	if err := json.Unmarshal(d.Body, &ev); err != nil {
 		return fmt.Errorf("invalid message format: %w", errTerminal)
@@ -229,6 +239,8 @@ func processEvent(ctx context.Context, d *amqp091.Delivery, client *http.Client,
 				releaseDelivery(store, ev.ID)
 				return fmt.Errorf("persist exhausted state: %w", err)
 			}
+			metric.IncDeliveryOutcomeFailed()
+			metric.IncDeliveryRetryExhausted()
 			return fmt.Errorf("event %s exhausted %d attempts: %w", ev.ID, maxAttempts, errTerminal)
 		}
 		attempt, err = store.RecordAttempt(ctx, ev.ID)
@@ -236,13 +248,20 @@ func processEvent(ctx context.Context, d *amqp091.Delivery, client *http.Client,
 			releaseDelivery(store, ev.ID)
 			return fmt.Errorf("persist attempt: %w", err)
 		}
+		metric.IncDeliveryAttempt()
+		if attempt > 1 {
+			metric.IncDeliveryRetry()
+		}
 		slog.InfoContext(ctx, "webhook delivery attempt started", "event_id", ev.ID, "attempt", attempt)
+		attemptStarted := time.Now()
 		deliveryErr := deliverEvent(ctx, client, ev, webhookSecret)
+		metric.ObserveDeliveryAttempt(time.Since(attemptStarted).Seconds())
 		if deliveryErr == nil {
 			if err := store.MarkDelivered(ctx, ev.ID); err != nil {
 				releaseDelivery(store, ev.ID)
 				return fmt.Errorf("persist delivered state: %w", err)
 			}
+			metric.IncDeliveryOutcomeSucceeded()
 			slog.InfoContext(ctx, "webhook delivery succeeded", "event_id", ev.ID, "attempt", attempt)
 			return nil
 		}
@@ -256,6 +275,8 @@ func processEvent(ctx context.Context, d *amqp091.Delivery, client *http.Client,
 			return fmt.Errorf("persist attempt failure: %w", err)
 		}
 		if final {
+			metric.IncDeliveryOutcomeFailed()
+			metric.IncDeliveryRetryExhausted()
 			slog.ErrorContext(ctx, "webhook delivery permanently failed", "event_id", ev.ID, "attempt", attempt, "error", observability.ErrorSummary(deliveryErr))
 			return fmt.Errorf("event %s failed after %d attempts: %w", ev.ID, attempt, errTerminal)
 		}

@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"notification-webhook-service/internal/delivery"
+	"notification-webhook-service/internal/observability"
 )
 
 type mockEventStore struct {
@@ -116,5 +119,49 @@ func TestEventHandler_NoPublisher(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected status %d when store is nil, got %d", http.StatusServiceUnavailable, w.Code)
+	}
+}
+
+func TestEventHandlerMetricsCountDurableAcceptanceAndRejections(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	metrics, err := observability.NewMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &mockEventStore{}
+	router := gin.New()
+	router.POST("/event", Event(store, metrics))
+	validBody := `{"target_url":"http://example.com","payload":{"ok":true}}`
+
+	accepted := httptest.NewRecorder()
+	router.ServeHTTP(accepted, httptest.NewRequest(http.MethodPost, "/event", strings.NewReader(validBody)))
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("valid event status=%d", accepted.Code)
+	}
+
+	invalid := httptest.NewRecorder()
+	router.ServeHTTP(invalid, httptest.NewRequest(http.MethodPost, "/event", strings.NewReader(`{"payload":}`)))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid event status=%d", invalid.Code)
+	}
+
+	store.err = errors.New("injected persistence failure")
+	persistenceFailure := httptest.NewRecorder()
+	router.ServeHTTP(persistenceFailure, httptest.NewRequest(http.MethodPost, "/event", strings.NewReader(validBody)))
+	if persistenceFailure.Code != http.StatusInternalServerError {
+		t.Fatalf("persistence failure status=%d", persistenceFailure.Code)
+	}
+
+	scrape := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(scrape, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	text, err := io.ReadAll(scrape.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(text), "notification_events_accepted_total 1") {
+		t.Fatalf("accepted metric did not reflect committed acceptance: %s", text)
+	}
+	if !strings.Contains(string(text), "notification_events_rejected_total 2") {
+		t.Fatalf("rejected metric did not count invalid and failed requests: %s", text)
 	}
 }

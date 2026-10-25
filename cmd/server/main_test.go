@@ -65,6 +65,7 @@ func TestShutdownServerDrainsRequestsAndCurrentConsumerWork(t *testing.T) {
 		close(consumerDone)
 	}()
 	dispatcherDone := make(chan struct{})
+	backlogDone := make(chan struct{})
 	dispatcherCanceled := make(chan struct{})
 	serviceCtx, cancelService := context.WithCancel(context.Background())
 	defer cancelService()
@@ -73,7 +74,8 @@ func TestShutdownServerDrainsRequestsAndCurrentConsumerWork(t *testing.T) {
 		shutdownResult <- shutdownServer(server.Config, func() { close(stopConsumer) }, func() {
 			close(dispatcherCanceled)
 			close(dispatcherDone)
-		}, cancelService, consumerDone, dispatcherDone, shutdownTimeouts{
+			close(backlogDone)
+		}, cancelService, consumerDone, dispatcherDone, backlogDone, shutdownTimeouts{
 			http: time.Second, consumer: time.Second, worker: time.Second,
 		})
 	}()
@@ -115,6 +117,11 @@ func TestShutdownServerDrainsRequestsAndCurrentConsumerWork(t *testing.T) {
 	default:
 		t.Fatal("dispatcher was not stopped")
 	}
+	select {
+	case <-backlogDone:
+	default:
+		t.Fatal("backlog sampler was not stopped")
+	}
 	if !errors.Is(serviceCtx.Err(), context.Canceled) {
 		t.Fatal("service context was not canceled after drain")
 	}
@@ -142,15 +149,16 @@ func TestShutdownServerForceClosesConnectionsAfterTimeout(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("blocking HTTP request did not start")
 	}
-	consumerDone, dispatcherDone := make(chan struct{}), make(chan struct{})
+	consumerDone, dispatcherDone, backlogDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	serviceCtx, cancelService := context.WithCancel(context.Background())
 	defer cancelService()
 	result := shutdownServer(server.Config,
 		func() { close(consumerDone) },
-		func() { close(dispatcherDone) },
+		func() { close(dispatcherDone); close(backlogDone) },
 		cancelService,
 		consumerDone,
 		dispatcherDone,
+		backlogDone,
 		shutdownTimeouts{http: 25 * time.Millisecond, consumer: time.Second, worker: time.Second},
 	)
 	if !errors.Is(result, context.DeadlineExceeded) {

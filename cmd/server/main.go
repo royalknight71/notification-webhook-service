@@ -39,6 +39,10 @@ func main() {
 func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	metrics, err := observability.NewMetrics()
+	if err != nil {
+		return fmt.Errorf("initialize metrics: %w", err)
+	}
 
 	dbPool, err := database.InitPool(ctx)
 	if err != nil {
@@ -67,7 +71,7 @@ func run() error {
 	if !ok {
 		return fmt.Errorf("publisher does not report health")
 	}
-	consumer, err := worker.StartConsumer(ctx, connector, os.Getenv("WEBHOOK_SECRET"), store, deadLetterPublisher)
+	consumer, err := worker.StartConsumer(ctx, connector, os.Getenv("WEBHOOK_SECRET"), store, deadLetterPublisher, metrics)
 	if err != nil {
 		return fmt.Errorf("start consumer: %w", err)
 	}
@@ -76,7 +80,8 @@ func run() error {
 	consumerHealthy.Store(true)
 	consumerFailed := observeWorker(ctx, consumerDone, func() { consumerHealthy.Store(false) }, consumer.Stopping)
 	dispatcherCtx, cancelDispatcher := context.WithCancel(ctx)
-	dispatcherDone := delivery.StartDispatcher(dispatcherCtx, store, publisher)
+	dispatcherDone := delivery.StartDispatcher(dispatcherCtx, store, publisher, metrics)
+	backlogDone := delivery.StartOutboxBacklogSampler(dispatcherCtx, store, metrics, 15*time.Second)
 	dispatcherHealthy := atomic.Bool{}
 	dispatcherHealthy.Store(true)
 	dispatcherFailed := observeWorker(dispatcherCtx, dispatcherDone, func() { dispatcherHealthy.Store(false) })
@@ -86,7 +91,8 @@ func run() error {
 	router.Use(gin.Recovery(), structuredRequestLog)
 	router.GET("/health", handler.Health)
 	router.GET("/ready", handler.Ready(dbPool, consumerHealthy.Load, dispatcherHealthy.Load, publisherHealth.Healthy))
-	router.POST("/event", handler.Event(store))
+	router.GET("/metrics", gin.WrapH(metrics.Handler()))
+	router.POST("/event", handler.Event(store, metrics))
 	srv := &http.Server{
 		Addr:              config.GetPort(),
 		Handler:           router,
@@ -120,7 +126,7 @@ func run() error {
 		}
 	}
 
-	shutdownErr := shutdownServer(srv, consumer.StopAccepting, cancelDispatcher, cancel, consumerDone, dispatcherDone, shutdownTimeouts{
+	shutdownErr := shutdownServer(srv, consumer.StopAccepting, cancelDispatcher, cancel, consumerDone, dispatcherDone, backlogDone, shutdownTimeouts{
 		http: httpShutdownTimeout, consumer: consumerDrainTimeout, worker: workerShutdownTimeout,
 	})
 	return errors.Join(stopReason, shutdownErr)
@@ -130,7 +136,7 @@ type shutdownTimeouts struct {
 	http, consumer, worker time.Duration
 }
 
-func shutdownServer(server *http.Server, stopConsumer func(), cancelDispatcher, cancelService context.CancelFunc, consumerDone, dispatcherDone <-chan struct{}, timeouts shutdownTimeouts) error {
+func shutdownServer(server *http.Server, stopConsumer func(), cancelDispatcher, cancelService context.CancelFunc, consumerDone, dispatcherDone, backlogDone <-chan struct{}, timeouts shutdownTimeouts) error {
 	var shutdownErrors []error
 	httpCtx, stopHTTP := context.WithTimeout(context.Background(), timeouts.http)
 	if err := server.Shutdown(httpCtx); err != nil {
@@ -146,6 +152,9 @@ func shutdownServer(server *http.Server, stopConsumer func(), cancelDispatcher, 
 
 	if err := waitForWorker(dispatcherDone, timeouts.worker); err != nil {
 		shutdownErrors = append(shutdownErrors, fmt.Errorf("outbox dispatcher did not stop after cancel: %w", err))
+	}
+	if err := waitForWorker(backlogDone, timeouts.worker); err != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("outbox backlog sampler did not stop after cancel: %w", err))
 	}
 	if err := waitForWorker(consumerDone, timeouts.consumer); err != nil {
 		shutdownErrors = append(shutdownErrors, fmt.Errorf("consumer drain timed out: %w", err))
