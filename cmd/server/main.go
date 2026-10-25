@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
-	"log"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,93 +17,173 @@ import (
 	"notification-webhook-service/internal/database"
 	"notification-webhook-service/internal/delivery"
 	"notification-webhook-service/internal/handler"
+	"notification-webhook-service/internal/observability"
 	"notification-webhook-service/internal/queue"
 	"notification-webhook-service/internal/worker"
 )
 
+const (
+	httpShutdownTimeout   = 5 * time.Second
+	consumerDrainTimeout  = 30 * time.Second
+	workerShutdownTimeout = 3 * time.Second
+)
+
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	if err := run(); err != nil {
+		slog.Error("service stopped with error", "error", observability.ErrorSummary(err))
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	dbPool, err := database.InitPool(ctx)
 	if err != nil {
-		log.Fatalf("failed to initialize database pool: %v", err)
+		return fmt.Errorf("initialize database pool: %w", err)
 	}
 	defer dbPool.Close()
 	store := delivery.NewStore(dbPool)
 	if err := store.Migrate(ctx); err != nil {
-		log.Fatalf("failed to apply database migrations: %v", err)
+		return fmt.Errorf("apply database migrations: %w", err)
 	}
+
 	connector, err := queue.InitConnector(ctx)
 	if err != nil {
-		log.Fatalf("failed to initialize required RabbitMQ connection: %v", err)
+		return fmt.Errorf("initialize required RabbitMQ connection: %w", err)
 	}
 	defer connector.Close()
 	publisher, err := queue.NewPublisher(connector)
 	if err != nil {
-		log.Fatalf("failed to initialize confirmed publisher: %v", err)
+		return fmt.Errorf("initialize confirmed publisher: %w", err)
 	}
 	deadLetterPublisher, ok := publisher.(queue.DeadLetterPublisher)
 	if !ok {
-		log.Fatalf("publisher does not support dead-letter messages")
+		return fmt.Errorf("publisher does not support dead-letter messages")
 	}
 	publisherHealth, ok := publisher.(queue.HealthReporter)
 	if !ok {
-		log.Fatalf("publisher does not report health")
+		return fmt.Errorf("publisher does not report health")
 	}
-	consumerDone, err := worker.StartConsumer(ctx, connector, os.Getenv("WEBHOOK_SECRET"), store, deadLetterPublisher)
+	consumer, err := worker.StartConsumer(ctx, connector, os.Getenv("WEBHOOK_SECRET"), store, deadLetterPublisher)
 	if err != nil {
-		log.Fatalf("failed to start consumer: %v", err)
+		return fmt.Errorf("start consumer: %w", err)
 	}
+	consumerDone := consumer.Done
 	consumerHealthy := atomic.Bool{}
 	consumerHealthy.Store(true)
-	consumerFailed := observeWorker(ctx, consumerDone, func() { consumerHealthy.Store(false) })
-	dispatcherDone := delivery.StartDispatcher(ctx, store, publisher)
+	consumerFailed := observeWorker(ctx, consumerDone, func() { consumerHealthy.Store(false) }, consumer.Stopping)
+	dispatcherCtx, cancelDispatcher := context.WithCancel(ctx)
+	dispatcherDone := delivery.StartDispatcher(dispatcherCtx, store, publisher)
 	dispatcherHealthy := atomic.Bool{}
 	dispatcherHealthy.Store(true)
-	dispatcherFailed := observeWorker(ctx, dispatcherDone, func() { dispatcherHealthy.Store(false) })
+	dispatcherFailed := observeWorker(dispatcherCtx, dispatcherDone, func() { dispatcherHealthy.Store(false) })
 
 	gin.SetMode(gin.ReleaseMode)
-	router := gin.Default()
+	router := gin.New()
+	router.Use(gin.Recovery(), structuredRequestLog)
 	router.GET("/health", handler.Health)
 	router.GET("/ready", handler.Ready(dbPool, consumerHealthy.Load, dispatcherHealthy.Load, publisherHealth.Healthy))
 	router.POST("/event", handler.Event(store))
-	srv := &http.Server{Addr: config.GetPort(), Handler: router}
+	srv := &http.Server{
+		Addr:              config.GetPort(),
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- srv.ListenAndServe() }()
+	slog.Info("HTTP server started", "address", srv.Addr)
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(quit)
+	var stopReason error
 	select {
 	case <-consumerFailed:
-		log.Printf("RabbitMQ consumer stopped unexpectedly; shutting down")
+		stopReason = errors.New("RabbitMQ consumer stopped unexpectedly")
+		slog.Error("service worker stopped unexpectedly", "worker", "consumer")
 	case <-dispatcherFailed:
-		log.Printf("outbox dispatcher stopped unexpectedly; shutting down")
+		stopReason = errors.New("outbox dispatcher stopped unexpectedly")
+		slog.Error("service worker stopped unexpectedly", "worker", "dispatcher")
 	case sig := <-quit:
-		log.Printf("shutdown signal received: %v", sig)
+		slog.Info("shutdown signal received", "signal", sig.String())
 	case err := <-serverDone:
-		if err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server failed: %v", err)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			stopReason = fmt.Errorf("HTTP server stopped unexpectedly: %w", err)
+			slog.Error("HTTP server stopped unexpectedly", "error", observability.ErrorSummary(err))
 		}
-		return
 	}
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("server forced to shutdown: %v", err)
+
+	shutdownErr := shutdownServer(srv, consumer.StopAccepting, cancelDispatcher, cancel, consumerDone, dispatcherDone, shutdownTimeouts{
+		http: httpShutdownTimeout, consumer: consumerDrainTimeout, worker: workerShutdownTimeout,
+	})
+	return errors.Join(stopReason, shutdownErr)
+}
+
+type shutdownTimeouts struct {
+	http, consumer, worker time.Duration
+}
+
+func shutdownServer(server *http.Server, stopConsumer func(), cancelDispatcher, cancelService context.CancelFunc, consumerDone, dispatcherDone <-chan struct{}, timeouts shutdownTimeouts) error {
+	var shutdownErrors []error
+	httpCtx, stopHTTP := context.WithTimeout(context.Background(), timeouts.http)
+	if err := server.Shutdown(httpCtx); err != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("drain HTTP server: %w", err))
+		slog.Warn("HTTP graceful shutdown timed out; closing active connections", "error", observability.ErrorSummary(err))
+		if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			shutdownErrors = append(shutdownErrors, fmt.Errorf("force-close HTTP server: %w", closeErr))
+		}
 	}
-	cancel()
+	stopHTTP()
+	stopConsumer()
+	cancelDispatcher()
+
+	if err := waitForWorker(dispatcherDone, timeouts.worker); err != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("outbox dispatcher did not stop after cancel: %w", err))
+	}
+	if err := waitForWorker(consumerDone, timeouts.consumer); err != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("consumer drain timed out: %w", err))
+	}
+	cancelService()
+	if err := waitForWorker(consumerDone, timeouts.worker); err != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("consumer did not stop after cancellation: %w", err))
+	}
+	if err := waitForWorker(dispatcherDone, timeouts.worker); err != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("outbox dispatcher did not stop after service cancellation: %w", err))
+	}
+	slog.Info("service shutdown complete")
+	return errors.Join(shutdownErrors...)
+}
+
+func waitForWorker(done <-chan struct{}, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	select {
-	case <-consumerDone:
-	case <-shutdownCtx.Done():
-		log.Printf("consumer did not stop before shutdown deadline")
-	}
-	select {
-	case <-dispatcherDone:
-	case <-shutdownCtx.Done():
-		log.Printf("outbox dispatcher did not stop before shutdown deadline")
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-func observeWorker(ctx context.Context, done <-chan struct{}, onUnexpectedStop func()) <-chan struct{} {
+func structuredRequestLog(c *gin.Context) {
+	started := time.Now()
+	c.Next()
+	slog.InfoContext(c.Request.Context(), "HTTP request completed",
+		"method", c.Request.Method,
+		"route", c.FullPath(),
+		"status", c.Writer.Status(),
+		"duration", time.Since(started),
+	)
+}
+
+func observeWorker(ctx context.Context, done <-chan struct{}, onUnexpectedStop func(), intentionalStop ...<-chan struct{}) <-chan struct{} {
 	failed := make(chan struct{})
 	go func() {
 		select {
@@ -109,6 +191,13 @@ func observeWorker(ctx context.Context, done <-chan struct{}, onUnexpectedStop f
 			return
 		case <-done:
 			if ctx.Err() == nil {
+				for _, stop := range intentionalStop {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+				}
 				onUnexpectedStop()
 				close(failed)
 			}

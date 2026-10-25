@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
+	"notification-webhook-service/internal/observability"
 	"notification-webhook-service/internal/queue"
 )
 
@@ -29,7 +30,7 @@ func StartDispatcher(ctx context.Context, store OutboxStore, publisher queue.Pub
 		for {
 			dispatchBatch(ctx, store, publisher)
 			if health, ok := publisher.(queue.HealthReporter); ok && !health.Healthy() {
-				log.Printf("outbox dispatcher stopped because publisher is unhealthy")
+				slog.Error("outbox dispatcher stopped because publisher is unhealthy")
 				return
 			}
 			select {
@@ -49,14 +50,16 @@ func dispatchBatch(ctx context.Context, store OutboxStore, publisher queue.Publi
 	items, err := store.ClaimOutbox(ctx, 1, 30*time.Second)
 	if err != nil {
 		if ctx.Err() == nil {
-			log.Printf("claim outbox: %v", err)
+			slog.ErrorContext(ctx, "outbox claim failed", "error", observability.ErrorSummary(err))
 		}
 		return
 	}
 	for _, item := range items {
 		if err := ctx.Err(); err != nil {
 			releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = store.ReleaseOutbox(releaseCtx, item.ID, item.ClaimToken)
+			if releaseErr := store.ReleaseOutbox(releaseCtx, item.ID, item.ClaimToken); releaseErr != nil {
+				slog.Error("outbox claim release failed during shutdown", "event_id", item.ID, "error", observability.ErrorSummary(releaseErr))
+			}
 			cancel()
 			return
 		}
@@ -65,17 +68,19 @@ func dispatchBatch(ctx context.Context, store OutboxStore, publisher queue.Publi
 			err = publisher.Publish(ctx, item.ID, body)
 		}
 		if err != nil {
-			log.Printf("publish outbox event %s: %v", item.ID, err)
+			slog.ErrorContext(ctx, "outbox publish failed", "event_id", item.ID, "error", observability.ErrorSummary(err))
 			releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			if releaseErr := store.ReleaseOutbox(releaseCtx, item.ID, item.ClaimToken); releaseErr != nil {
-				log.Printf("release outbox event %s: %v", item.ID, releaseErr)
+				slog.Error("outbox claim release failed", "event_id", item.ID, "error", observability.ErrorSummary(releaseErr))
 			}
 			cancel()
 			continue
 		}
 		markCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		if err := store.MarkPublished(markCtx, item.ID, item.ClaimToken); err != nil {
-			log.Printf("mark outbox event %s published: %v", item.ID, err)
+			slog.ErrorContext(ctx, "outbox publish state update failed", "event_id", item.ID, "error", observability.ErrorSummary(err))
+		} else {
+			slog.InfoContext(ctx, "outbox event published", "event_id", item.ID)
 		}
 		cancel()
 	}

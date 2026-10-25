@@ -10,13 +10,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/rabbitmq/amqp091-go"
 	"notification-webhook-service/internal/delivery"
+	"notification-webhook-service/internal/observability"
 	"notification-webhook-service/internal/queue"
 )
 
@@ -34,29 +36,65 @@ type DeliveryStore interface {
 	ReleaseDelivery(context.Context, string) error
 }
 
-// StartConsumer starts a single-message-at-a-time worker and returns a channel
-// closed after cancellation has been handled and the worker exits.
-func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret string, store DeliveryStore, deadLetters queue.DeadLetterPublisher) (<-chan struct{}, error) {
+// ConsumerHandle lets shutdown stop intake while allowing the current delivery
+// to finish before the service context is canceled.
+type ConsumerHandle struct {
+	Done     <-chan struct{}
+	Stopping <-chan struct{}
+	stop     chan struct{}
+	once     sync.Once
+}
+
+func (c *ConsumerHandle) StopAccepting() {
+	c.once.Do(func() { close(c.stop) })
+}
+
+// StartConsumer starts a single-message-at-a-time worker. StopAccepting stops
+// intake after the current delivery finishes; the service context remains the
+// hard-stop path.
+func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret string, store DeliveryStore, deadLetters queue.DeadLetterPublisher) (*ConsumerHandle, error) {
+	// Processing is serial; a prefetch of one keeps shutdown from accumulating
+	// unbounded unacknowledged deliveries in the client.
+	if err := conn.Channel.Qos(1, 0, false); err != nil {
+		return nil, fmt.Errorf("configure consumer prefetch: %w", err)
+	}
 	msgs, err := conn.Channel.Consume(conn.Queue, "", false, false, false, false, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start consumer: %w", err)
 	}
 	done := make(chan struct{})
+	stop := make(chan struct{})
+	handle := &ConsumerHandle{Done: done, Stopping: stop, stop: stop}
 	client := &http.Client{Timeout: 5 * time.Second}
 	go func() {
 		defer close(done)
 		retryAttempt := 0
 		for {
+			if ctx.Err() != nil {
+				return
+			}
+			select {
+			case <-handle.stop:
+				return
+			default:
+			}
 			select {
 			case <-ctx.Done():
+				return
+			case <-handle.stop:
 				return
 			case d, ok := <-msgs:
 				if !ok {
 					return
 				}
+				select {
+				case <-handle.stop:
+					return
+				default:
+				}
 				acked, err := processDelivery(ctx, &d, client, webhookSecret, store, deadLetters)
 				if err != nil {
-					log.Printf("event processing error: %v", err)
+					slog.ErrorContext(ctx, "delivery processing failed", "event_id", d.MessageId, "error", observability.ErrorSummary(err))
 					if ctx.Err() != nil {
 						return
 					}
@@ -65,7 +103,7 @@ func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret str
 						return
 					}
 					if nackErr := d.Nack(false, true); nackErr != nil {
-						log.Printf("NACK event: %v", nackErr)
+						slog.ErrorContext(ctx, "delivery nack failed", "event_id", d.MessageId, "error", observability.ErrorSummary(nackErr))
 					}
 				} else if acked {
 					retryAttempt = 0
@@ -73,14 +111,14 @@ func StartConsumer(ctx context.Context, conn *queue.Connector, webhookSecret str
 			}
 		}
 	}()
-	return done, nil
+	return handle, nil
 }
 
 func processDelivery(ctx context.Context, d *amqp091.Delivery, client *http.Client, webhookSecret string, store DeliveryStore, deadLetters queue.DeadLetterPublisher) (bool, error) {
 	err := processEvent(ctx, d, client, webhookSecret, store)
 	if err == nil {
 		if ackErr := d.Ack(false); ackErr != nil {
-			log.Printf("ACK event: %v", ackErr)
+			slog.ErrorContext(ctx, "delivery ack failed", "event_id", d.MessageId, "error", observability.ErrorSummary(ackErr))
 			return false, nil
 		}
 		return true, nil
@@ -88,7 +126,9 @@ func processDelivery(ctx context.Context, d *amqp091.Delivery, client *http.Clie
 	if errors.Is(err, errTerminal) {
 		err = routeTerminalMessage(ctx, deadLetters, d.MessageId, d.Body, func() error { return d.Ack(false) })
 		if err != nil {
-			log.Printf("dead-letter event %s: %v", d.MessageId, err)
+			slog.ErrorContext(ctx, "dead-letter routing failed", "event_id", d.MessageId, "error", observability.ErrorSummary(err))
+		} else {
+			slog.InfoContext(ctx, "dead-letter routing succeeded", "event_id", d.MessageId)
 		}
 		return err == nil, err
 	}
@@ -150,7 +190,7 @@ func releaseDelivery(store DeliveryStore, eventID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := store.ReleaseDelivery(ctx, eventID); err != nil {
-		log.Printf("release delivery %s: %v", eventID, err)
+		slog.Error("delivery claim release failed", "event_id", eventID, "error", observability.ErrorSummary(err))
 	}
 }
 
@@ -196,12 +236,14 @@ func processEvent(ctx context.Context, d *amqp091.Delivery, client *http.Client,
 			releaseDelivery(store, ev.ID)
 			return fmt.Errorf("persist attempt: %w", err)
 		}
+		slog.InfoContext(ctx, "webhook delivery attempt started", "event_id", ev.ID, "attempt", attempt)
 		deliveryErr := deliverEvent(ctx, client, ev, webhookSecret)
 		if deliveryErr == nil {
 			if err := store.MarkDelivered(ctx, ev.ID); err != nil {
 				releaseDelivery(store, ev.ID)
 				return fmt.Errorf("persist delivered state: %w", err)
 			}
+			slog.InfoContext(ctx, "webhook delivery succeeded", "event_id", ev.ID, "attempt", attempt)
 			return nil
 		}
 		if ctx.Err() != nil {
@@ -214,10 +256,12 @@ func processEvent(ctx context.Context, d *amqp091.Delivery, client *http.Client,
 			return fmt.Errorf("persist attempt failure: %w", err)
 		}
 		if final {
+			slog.ErrorContext(ctx, "webhook delivery permanently failed", "event_id", ev.ID, "attempt", attempt, "error", observability.ErrorSummary(deliveryErr))
 			return fmt.Errorf("event %s failed after %d attempts: %w", ev.ID, attempt, errTerminal)
 		}
 		backoff := time.Duration(100*int64(1<<uint(attempt-1))) * time.Millisecond
 		jitter := time.Duration(randInt63n(100)) * time.Millisecond
+		slog.WarnContext(ctx, "webhook delivery will retry", "event_id", ev.ID, "attempt", attempt, "retry_delay", backoff+jitter, "error", observability.ErrorSummary(deliveryErr))
 		select {
 		case <-time.After(backoff + jitter):
 		case <-ctx.Done():
@@ -246,8 +290,8 @@ func deliverEvent(ctx context.Context, client *http.Client, ev EventMessage, sec
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
-	body, _ := io.ReadAll(resp.Body)
-	return fmt.Errorf("non-2xx response %d: %s", resp.StatusCode, string(body))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return fmt.Errorf("non-2xx response %d", resp.StatusCode)
 }
 
 func randInt63n(n int64) int64 { return rand.Int63n(n) }

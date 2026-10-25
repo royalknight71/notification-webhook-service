@@ -19,7 +19,7 @@ Run the service with `go run ./cmd/server`. The server applies embedded, version
 
 ## API
 
-`GET /health` returns `200` when the process is alive. `GET /ready` checks PostgreSQL.
+`GET /health` is a liveness check and returns `200` while the process is running; it does not query dependencies. `GET /ready` checks worker/publisher health and performs one serialized PostgreSQL ping with a one-second timeout. A failed or overlapping readiness check returns `503` without allowing health probes to occupy the pool concurrently.
 
 `POST /event` accepts:
 
@@ -65,7 +65,7 @@ The dispatcher claims pending outbox rows with `FOR UPDATE SKIP LOCKED` and a le
 
 The consumer claims delivery rows with a lease, persists each attempt and its error, and retries webhook calls up to five total attempts with exponential backoff and random jitter. Exhausted deliveries are durably marked `failed`. Retryable processing/database errors are requeued with cancellable exponential backoff capped at five seconds; they are not marked failed when PostgreSQL cannot persist their state. Terminal messages are published to a separate durable dead-letter queue and the original is ACKed only after publisher confirmation. The dead-letter exchange and queue names are derived by appending `.dead-letter` to the configured exchange and queue names; the existing work queue is redeclared unchanged.
 
-Readiness checks PostgreSQL, the consumer, and publisher/dispatcher health. An unusable publisher stops the dispatcher and triggers controlled service shutdown so pending outbox rows can resume after restart.
+Readiness checks PostgreSQL, the consumer, and publisher/dispatcher health. An unusable publisher stops the dispatcher and triggers controlled service shutdown so pending outbox rows can resume after restart. Application logs use JSON fields for event IDs, delivery attempts, retry delays, errors, and HTTP status without logging webhook payloads or signature secrets. Request URLs are omitted from transport error summaries.
 
 Delivery is **at least once**, not exactly once. A process can fail after the webhook receiver accepts a request but before PostgreSQL records success; the webhook can then be called again. A RabbitMQ confirmation can also be lost after the broker accepted a publish, causing the outbox to publish a duplicate. The event ID is stable in the webhook request; receivers should use it for deduplication.
 
@@ -91,4 +91,8 @@ go test ./internal/queue -run TestRabbitMQ -v
 go test ./internal/integration -run TestEndToEnd -v
 ```
 
-For PowerShell, set `TEST_DATABASE_URL` to a disposable local database (for the Compose defaults: `postgres://user:password@localhost:5432/notification_service?sslmode=disable`) and `TEST_RABBITMQ_URL` to a disposable vhost (for example `amqp://guest:guest@localhost:5672/`) before running the commands. The tests clean up their schemas and uniquely named RabbitMQ resources. Unit tests use fakes and do not require Docker. `docker-compose.yml` starts only PostgreSQL and RabbitMQ; run the Go server separately.
+For PowerShell, set `TEST_DATABASE_URL` to a disposable local database (for the Compose defaults: `postgres://user:password@localhost:5433/notification_service?sslmode=disable`) and `TEST_RABBITMQ_URL` to a disposable vhost (for example `amqp://guest:guest@localhost:5672/`) before running the commands. The tests clean up their schemas and uniquely named RabbitMQ resources. Unit tests use fakes and do not require Docker. `docker-compose.yml` starts only PostgreSQL and RabbitMQ; run the Go server separately.
+
+### Shutdown and timeouts
+
+The HTTP server applies read/header/write/idle timeouts. On shutdown it stops accepting requests and drains active HTTP handlers for up to five seconds, then force-closes active connections if needed. It stops outbox publishing, asks the consumer to stop taking new messages, and allows its current delivery up to 30 seconds to finish. If that drain expires, the service context is canceled; any unacknowledged RabbitMQ delivery is recovered by RabbitMQ when the connection closes. PostgreSQL operations have a five-second bound, migrations have a 30-second bound, and final worker stop waits are bounded to three seconds. These are bounded best-effort shutdown guarantees; webhook delivery remains at least once.
