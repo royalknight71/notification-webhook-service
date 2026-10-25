@@ -204,6 +204,14 @@ func (s *Store) ReleaseOutbox(ctx context.Context, id, token string) error {
 	return err
 }
 
+func (s *Store) PendingOutboxCount(ctx context.Context) (int64, error) {
+	ctx, cancel := databaseContext(ctx)
+	defer cancel()
+	var count int64
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM delivery_outbox WHERE published_at IS NULL`).Scan(&count)
+	return count, err
+}
+
 func (s *Store) ClaimDelivery(ctx context.Context, id string, lease time.Duration) (ClaimResult, int, error) {
 	ctx, cancel := databaseContext(ctx)
 	defer cancel()

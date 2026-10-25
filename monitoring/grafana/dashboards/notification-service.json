@@ -1,0 +1,96 @@
+{
+  "annotations": { "list": [] },
+  "description": "Prometheus metrics for the Notification & Webhook Delivery Service.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "increase(notification_events_accepted_total[$__rate_interval])", "legendFormat": "accepted", "refId": "A" },
+        { "expr": "increase(notification_events_rejected_total[$__rate_interval])", "legendFormat": "rejected", "refId": "B" }
+      ],
+      "title": "Event outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "increase(notification_delivery_attempts_total[$__rate_interval])", "legendFormat": "attempts", "refId": "A" },
+        { "expr": "increase(notification_delivery_retries_total[$__rate_interval])", "legendFormat": "retries", "refId": "B" }
+      ],
+      "title": "Delivery attempts",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (outcome) (increase(notification_delivery_outcomes_total[$__rate_interval]))", "legendFormat": "{{outcome}}", "refId": "A" },
+        { "expr": "increase(notification_delivery_retry_exhausted_total[$__rate_interval])", "legendFormat": "retry exhausted", "refId": "B" }
+      ],
+      "title": "Durable delivery outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(notification_delivery_attempt_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95", "refId": "A" },
+        { "expr": "sum(rate(notification_delivery_attempt_duration_seconds_sum[$__rate_interval])) / sum(rate(notification_delivery_attempt_duration_seconds_count[$__rate_interval]))", "legendFormat": "average", "refId": "B" }
+      ],
+      "title": "Webhook attempt duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "min": 0, "max": 1, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": 0 }, { "color": "green", "value": 1 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 16 },
+      "id": 5,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showPercentChange": false, "textMode": "auto" },
+      "targets": [
+        { "expr": "notification_consumer_running", "legendFormat": "consumer", "refId": "A" },
+        { "expr": "notification_outbox_dispatcher_running", "legendFormat": "dispatcher", "refId": "B" }
+      ],
+      "title": "Worker status (1 = running)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 10 }] }, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 16 },
+      "id": 6,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "showPercentChange": false, "textMode": "auto" },
+      "targets": [{ "expr": "notification_outbox_pending", "legendFormat": "unpublished rows", "refId": "A" }],
+      "title": "Pending outbox rows",
+      "type": "stat"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 41,
+  "tags": ["notification-service", "webhook"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Notification & Webhook Delivery",
+  "uid": "notification-webhook",
+  "version": 1
+}

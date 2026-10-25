@@ -66,6 +66,9 @@ func TestStorePostgresIntegration(t *testing.T) {
 	if err != nil || inserted {
 		t.Fatalf("duplicate accept inserted=%v err=%v", inserted, err)
 	}
+	if pending, err := store.PendingOutboxCount(ctx); err != nil || pending != 1 {
+		t.Fatalf("pending outbox count=%d err=%v, want 1", pending, err)
+	}
 	conflict := event
 	conflict.TargetURL = "https://different.test/"
 	if _, err := store.Accept(ctx, conflict); err != ErrIDConflict {
@@ -88,6 +91,9 @@ func TestStorePostgresIntegration(t *testing.T) {
 	}
 	if err := store.MarkPublished(ctx, event.ID, claimToken); err != nil {
 		t.Fatal(err)
+	}
+	if pending, err := store.PendingOutboxCount(ctx); err != nil || pending != 0 {
+		t.Fatalf("pending outbox count after publish=%d err=%v, want 0", pending, err)
 	}
 	claim, attempts, err := store.ClaimDelivery(ctx, event.ID, time.Minute)
 	if err != nil || claim != Claimed || attempts != 0 {

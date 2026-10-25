@@ -21,10 +21,16 @@ type OutboxStore interface {
 // StartDispatcher continuously publishes committed outbox rows. Claims are leased,
 // so a process crash releases work automatically without holding DB transactions
 // across RabbitMQ network operations.
-func StartDispatcher(ctx context.Context, store OutboxStore, publisher queue.Publisher) <-chan struct{} {
+func StartDispatcher(ctx context.Context, store OutboxStore, publisher queue.Publisher, metrics ...*observability.Metrics) <-chan struct{} {
+	var metric *observability.Metrics
+	if len(metrics) > 0 {
+		metric = metrics[0]
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		metric.SetDispatcherRunning(true)
+		defer metric.SetDispatcherRunning(false)
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		for {

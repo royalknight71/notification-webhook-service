@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/rabbitmq/amqp091-go"
 	"notification-webhook-service/internal/delivery"
+	"notification-webhook-service/internal/observability"
 )
 
 type testStore struct {
@@ -143,7 +145,11 @@ func TestProcessEvent_Success(t *testing.T) {
 	bodyBytes, _ := json.Marshal(ev)
 	d := amqp091.Delivery{Body: bodyBytes}
 	store := &testStore{}
-	if err := processEvent(ctx, &d, client, "", store); err != nil {
+	metrics, err := observability.NewMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := processEvent(ctx, &d, client, "", store, metrics); err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}
 	mt.mu.Lock()
@@ -154,6 +160,10 @@ func TestProcessEvent_Success(t *testing.T) {
 	}
 	if store.state != "delivered" || store.attempts != 1 {
 		t.Fatalf("unexpected persisted state=%s attempts=%d", store.state, store.attempts)
+	}
+	text := scrapeMetrics(t, metrics)
+	if !strings.Contains(text, "notification_delivery_attempts_total 1") || !strings.Contains(text, `notification_delivery_outcomes_total{outcome="succeeded"} 1`) || !strings.Contains(text, "notification_delivery_attempt_duration_seconds_count 1") {
+		t.Fatalf("success metrics do not match persisted delivery state: %s", text)
 	}
 }
 
@@ -166,7 +176,11 @@ func TestProcessEvent_RetryAndFailure(t *testing.T) {
 	bodyBytes, _ := json.Marshal(ev)
 	d := amqp091.Delivery{Body: bodyBytes}
 	store := &testStore{}
-	err := processEvent(ctx, &d, client, "", store)
+	metrics, err := observability.NewMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = processEvent(ctx, &d, client, "", store, metrics)
 	if err == nil {
 		t.Fatalf("expected error after retries, got nil")
 	}
@@ -178,6 +192,18 @@ func TestProcessEvent_RetryAndFailure(t *testing.T) {
 	}
 	if store.state != "failed" || store.attempts != 5 || store.lastError == "" {
 		t.Fatalf("failure state not persisted: %#v", store)
+	}
+	text := scrapeMetrics(t, metrics)
+	for _, expected := range []string{
+		"notification_delivery_attempts_total 5",
+		"notification_delivery_retries_total 4",
+		"notification_delivery_retry_exhausted_total 1",
+		`notification_delivery_outcomes_total{outcome="failed"} 1`,
+		"notification_delivery_attempt_duration_seconds_count 5",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Errorf("failure metrics missing %q:\n%s", expected, text)
+		}
 	}
 }
 
@@ -423,11 +449,19 @@ func TestProcessEvent_StatusUpdateFailureRequeues(t *testing.T) {
 	ev := EventMessage{ID: "status", TargetURL: "http://example.com", Payload: json.RawMessage(`{"ok":true}`)}
 	body, _ := json.Marshal(ev)
 	d := amqp091.Delivery{Body: body}
-	if err := processEvent(context.Background(), &d, client, "", store); err == nil {
+	metrics, err := observability.NewMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := processEvent(context.Background(), &d, client, "", store, metrics); err == nil {
 		t.Fatal("expected status persistence failure")
 	}
 	if store.state != "pending" {
 		t.Fatalf("delivery not released after status failure: %s", store.state)
+	}
+	text := scrapeMetrics(t, metrics)
+	if strings.Contains(text, `notification_delivery_outcomes_total{outcome=`) || strings.Contains(text, "notification_delivery_retry_exhausted_total 1") {
+		t.Fatalf("unpersisted delivery outcome was counted: %s", text)
 	}
 }
 
@@ -491,4 +525,14 @@ func TestConsumerStopAcceptingIsIdempotent(t *testing.T) {
 	default:
 		t.Fatal("consumer stop signal was not closed")
 	}
+}
+
+func scrapeMetrics(t *testing.T, metrics *observability.Metrics) string {
+	t.Helper()
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("metrics endpoint status=%d", response.Code)
+	}
+	return response.Body.String()
 }

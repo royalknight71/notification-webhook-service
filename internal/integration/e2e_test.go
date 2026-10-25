@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"notification-webhook-service/internal/delivery"
 	"notification-webhook-service/internal/handler"
+	"notification-webhook-service/internal/observability"
 	"notification-webhook-service/internal/queue"
 	"notification-webhook-service/internal/worker"
 )
@@ -56,8 +57,14 @@ func TestEndToEndEventDeliveryRetryAndDeadLetter(t *testing.T) {
 		cleanupDB()
 		t.Fatal(err)
 	}
+	metrics, err := observability.NewMetrics()
+	if err != nil {
+		_ = connector.Close()
+		cleanupDB()
+		t.Fatal(err)
+	}
 	serviceCtx, stopService := context.WithCancel(ctx)
-	consumer, err := worker.StartConsumer(serviceCtx, connector, "integration-secret", store, publisher.(queue.DeadLetterPublisher))
+	consumer, err := worker.StartConsumer(serviceCtx, connector, "integration-secret", store, publisher.(queue.DeadLetterPublisher), metrics)
 	if err != nil {
 		stopService()
 		_ = connector.Close()
@@ -65,7 +72,8 @@ func TestEndToEndEventDeliveryRetryAndDeadLetter(t *testing.T) {
 		t.Fatal(err)
 	}
 	consumerDone := consumer.Done
-	dispatcherDone := delivery.StartDispatcher(serviceCtx, store, publisher)
+	dispatcherDone := delivery.StartDispatcher(serviceCtx, store, publisher, metrics)
+	backlogDone := delivery.StartOutboxBacklogSampler(serviceCtx, store, metrics, 10*time.Millisecond)
 	t.Cleanup(func() {
 		consumer.StopAccepting()
 		stopService()
@@ -78,6 +86,11 @@ func TestEndToEndEventDeliveryRetryAndDeadLetter(t *testing.T) {
 		case <-dispatcherDone:
 		case <-time.After(5 * time.Second):
 			t.Error("dispatcher did not stop")
+		}
+		select {
+		case <-backlogDone:
+		case <-time.After(5 * time.Second):
+			t.Error("backlog sampler did not stop")
 		}
 		cleanup, err := connector.Conn.Channel()
 		if err != nil {
@@ -114,7 +127,8 @@ func TestEndToEndEventDeliveryRetryAndDeadLetter(t *testing.T) {
 	}))
 	defer webhook.Close()
 	router := gin.New()
-	router.POST("/event", handler.Event(store))
+	router.GET("/metrics", gin.WrapH(metrics.Handler()))
+	router.POST("/event", handler.Event(store, metrics))
 	api := httptest.NewServer(router)
 	defer api.Close()
 
@@ -164,6 +178,35 @@ func TestEndToEndEventDeliveryRetryAndDeadLetter(t *testing.T) {
 	waitDeadLetter(t, ctx, connector, unknownID)
 	if state, err := store.GetDeliveryState(ctx, unknownID); err == nil || state != "" {
 		t.Fatalf("unknown delivery unexpectedly persisted: state=%q err=%v", state, err)
+	}
+
+	metricsResponse, err := http.Get(api.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsBody, readErr := io.ReadAll(metricsResponse.Body)
+	_ = metricsResponse.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if metricsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("metrics endpoint status=%d body=%s", metricsResponse.StatusCode, metricsBody)
+	}
+	for _, expected := range []string{
+		"notification_events_accepted_total 2",
+		"notification_delivery_attempts_total 6",
+		"notification_delivery_retries_total 4",
+		"notification_delivery_retry_exhausted_total 1",
+		`notification_delivery_outcomes_total{outcome="succeeded"} 1`,
+		`notification_delivery_outcomes_total{outcome="failed"} 1`,
+		"notification_delivery_attempt_duration_seconds_count 6",
+		"notification_outbox_pending 0",
+		"notification_consumer_running 1",
+		"notification_outbox_dispatcher_running 1",
+	} {
+		if !strings.Contains(string(metricsBody), expected) {
+			t.Errorf("metrics endpoint missing %q:\n%s", expected, metricsBody)
+		}
 	}
 }
 

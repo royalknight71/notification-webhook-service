@@ -21,6 +21,8 @@ Run the service with `go run ./cmd/server`. The server applies embedded, version
 
 `GET /health` is a liveness check and returns `200` while the process is running; it does not query dependencies. `GET /ready` checks worker/publisher health and performs one serialized PostgreSQL ping with a one-second timeout. A failed or overlapping readiness check returns `503` without allowing health probes to occupy the pool concurrently.
 
+`GET /metrics` exposes application metrics in Prometheus text format. It uses a private registry and exposes no event IDs, delivery IDs, URLs, payloads, or secrets. `notification_consumer_running` and `notification_outbox_dispatcher_running` report whether those worker goroutines are running (`1`) or stopped (`0`); use `/ready` for dependency readiness.
+
 `POST /event` accepts:
 
 ```json
@@ -70,6 +72,47 @@ Readiness checks PostgreSQL, the consumer, and publisher/dispatcher health. An u
 Delivery is **at least once**, not exactly once. A process can fail after the webhook receiver accepts a request but before PostgreSQL records success; the webhook can then be called again. A RabbitMQ confirmation can also be lost after the broker accepted a publish, causing the outbox to publish a duplicate. The event ID is stable in the webhook request; receivers should use it for deduplication.
 
 The current dispatcher does not automatically reconnect a closed RabbitMQ channel and has no operator-facing outbox error state. If RabbitMQ becomes unavailable after startup and the channel closes, pending outbox records remain safe in PostgreSQL but will not publish until the service is restarted.
+
+### Metrics and Prometheus
+
+The metrics endpoint includes:
+
+- `notification_events_accepted_total` and `notification_events_rejected_total` for API request outcomes. Acceptance is counted after the event/outbox transaction commits.
+- `notification_delivery_attempts_total` and `notification_delivery_retries_total` for attempts whose counts were persisted before the webhook call.
+- `notification_delivery_outcomes_total` and `notification_delivery_retry_exhausted_total` for durable delivery-state transitions. The `outcome` label on the former is limited to `succeeded` or `failed`.
+- `notification_delivery_attempt_duration_seconds` as a histogram of individual webhook attempts.
+- `notification_outbox_pending` as a PostgreSQL count of unpublished outbox rows, refreshed every 15 seconds. If a sample fails, the gauge retains its last successful value.
+- `notification_consumer_running` and `notification_outbox_dispatcher_running` as worker process gauges. A running gauge means its goroutine is alive; it does not replace readiness checks.
+
+### Local Prometheus and Grafana dashboard
+
+Docker Compose can run a local Prometheus and Grafana alongside the existing PostgreSQL and RabbitMQ services. Prometheus reaches the host process through the Docker Desktop host gateway, not container-local `localhost`. The scrape interval is five seconds, and the Prometheus configuration and Grafana dashboard are provisioned from `monitoring/`.
+
+Start the dependencies and monitoring containers from the repository directory:
+
+```powershell
+docker compose up -d postgres rabbitmq prometheus grafana
+$env:PORT = '8082'
+go run ./cmd/server
+```
+
+Set the server's required `DATABASE_URL` and `RABBITMQ_URL` in your local shell as described under Requirements before running it; keep real credentials out of shared command history and documentation.
+
+The example uses port `8082` to avoid collisions with other host services; the checked-in scrape target matches it. The server defaults to `8080`, so if you remove or adjust `PORT`, also update the target in `monitoring/prometheus/prometheus.yml`.
+
+Open the dashboard at `http://localhost:3001/d/notification-webhook/notification-webhook`. Grafana anonymous access is enabled as a Viewer and its port is bound to loopback for local demonstration. Prometheus is available at `http://localhost:9090/targets`; its UI and Grafana are also bound to loopback. The dashboard has panels for accepted/rejected events, attempts/retries, durable delivery outcomes, attempt duration, worker status, and unpublished outbox rows. Panels query only metrics listed above. Initially, counters may be zero until requests or delivery attempts occur; histogram quantiles need observations before they become meaningful.
+
+For API access while the server is running, request `http://localhost:8082/metrics`. The provisioned Prometheus scrape configuration is:
+
+```yaml
+scrape_configs:
+  - job_name: notification-webhook-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8082"]
+```
+
+When using a different `PORT`, update `monitoring/prometheus/prometheus.yml` to match it. To stop only the containers started for this dashboard and the service dependencies, run `docker compose stop grafana prometheus rabbitmq postgres`; this stops containers without removing their data volumes. Rising delivery retries or exhausted retries indicate webhook failures; a growing outbox gauge indicates events waiting for RabbitMQ publishing. The Prometheus Go client provides exposition format and concurrency-safe metric collectors.
 
 ## Development checks
 
