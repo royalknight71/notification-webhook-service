@@ -2,6 +2,25 @@
 
 An HTTP service that accepts events, stores delivery work in PostgreSQL, publishes through a RabbitMQ transactional outbox, and sends webhook requests asynchronously.
 
+## Architecture and event lifecycle
+
+The request path persists the event, delivery, and outbox record before returning. Publishing and webhook delivery then happen asynchronously.
+
+```mermaid
+flowchart LR
+    Client -->|POST /event| API
+    API -->|commit event, delivery, and outbox| DB[(PostgreSQL)]
+    API -->|202 after commit| Client
+    DB -->|lease pending outbox row| Dispatcher
+    Dispatcher -->|publish and confirm| RabbitMQ[(RabbitMQ)]
+    RabbitMQ --> Consumer
+    Consumer -->|persist attempts and state| DB
+    Consumer -->|signed HTTP attempts with backoff| Webhook[Webhook destination]
+    Consumer -->|confirmed terminal publish before ACK| DeadLetter[Dead-letter queue]
+    Service[Go service] -->|/metrics scrape| Prometheus
+    Prometheus --> Grafana
+```
+
 ## Requirements and configuration
 
 - Go 1.22+
@@ -52,10 +71,14 @@ For example, from another PowerShell terminal:
 
 ```powershell
 $body = '{"target_url":"http://127.0.0.1:8091/","payload":{"message":"local test"}}'
-Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8081/event' -ContentType 'application/json' -Body $body
+$key = [guid]::NewGuid().ToString()
+$headers = @{ 'Idempotency-Key' = $key }
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8080/event' -ContentType 'application/json' -Headers $headers -Body $body
 ```
 
-The response includes the event ID. Check its persisted result with:
+The response includes the event ID. Repeat the same request with the same `$key` and `$body` to see an idempotent replay: it returns the same event ID with `Idempotency-Replayed: true` and does not create another event or outbox row. Reusing that key after changing the target URL or raw payload bytes returns `409 Conflict`. The first accepted request returns `Idempotency-Replayed: false`. Requests without an `Idempotency-Key` continue to receive a new event ID on each accepted request.
+
+Check the persisted result with:
 
 ```powershell
 docker exec notification-webhook-service-postgres-1 psql -U user -d notification_service -c "SELECT state, delivered_at FROM deliveries WHERE event_id = '<event-id>';"
